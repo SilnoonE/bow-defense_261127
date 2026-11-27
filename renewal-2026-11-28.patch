@@ -1,0 +1,3173 @@
+--- before/app/build.gradle.kts
++++ after/app/build.gradle.kts
+@@ -12,14 +12,17 @@
+         applicationId = "com.example.bowdefense"
+         minSdk = 24
+         targetSdk = 36
+-        versionCode = 9
+-        versionName = "9.0"
++        versionCode = 10
++        versionName = "2.0.0"
+ 
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+     }
+ 
++    buildFeatures { buildConfig = true }
+     buildTypes {
++        debug { buildConfigField("boolean", "ADS_ENABLED", "false") }
+         release {
++            buildConfigField("boolean", "ADS_ENABLED", "true")
+             isMinifyEnabled = false
+             proguardFiles(
+                 getDefaultProguardFile("proguard-android-optimize.txt"),
+--- before/app/src/androidTest/java/com/example/bowdefense/PersistenceTest.kt
++++ after/app/src/androidTest/java/com/example/bowdefense/PersistenceTest.kt
+@@ -0,0 +1,58 @@
++package com.example.bowdefense
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import androidx.test.platform.app.InstrumentationRegistry
++import org.junit.Test
++import org.junit.Assert.*
++import org.junit.runner.RunWith
++import kotlinx.coroutines.runBlocking
++import java.util.UUID
++
++@RunWith(AndroidJUnit4::class)
++class PersistenceTest {
++    private val context=InstrumentationRegistry.getInstrumentation().targetContext
++    @Test fun migrationPreservesLegacyRecordsAndAchievements() = runBlocking {
++        val name="migration-test-${UUID.randomUUID()}"
++        val old=context.openOrCreateDatabase(name,0,null)
++        old.execSQL("CREATE TABLE IF NOT EXISTS `game_records` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `playDate` INTEGER NOT NULL, `survivalTimeSeconds` INTEGER NOT NULL, `score` INTEGER NOT NULL, `killCount` INTEGER NOT NULL, `arrowsShot` INTEGER NOT NULL, `hitCount` INTEGER NOT NULL, `accuracy` REAL NOT NULL, `goldEarned` INTEGER NOT NULL, `goldSpent` INTEGER NOT NULL, `shopPurchaseCount` INTEGER NOT NULL, `bowChangeCount` INTEGER NOT NULL, `maxStage` INTEGER NOT NULL, `maxWave` INTEGER NOT NULL, `resultType` TEXT NOT NULL, `isLowHpSurvivalAchieved` INTEGER NOT NULL)")
++        old.execSQL("CREATE TABLE IF NOT EXISTS `achievements` (`id` INTEGER NOT NULL, `name` TEXT NOT NULL, `description` TEXT NOT NULL, `category` TEXT NOT NULL, `targetValue` INTEGER NOT NULL, `currentValue` INTEGER NOT NULL, `rewardGold` INTEGER NOT NULL, `isUnlocked` INTEGER NOT NULL, `isRewardClaimed` INTEGER NOT NULL, PRIMARY KEY(`id`))")
++        old.execSQL("CREATE TABLE IF NOT EXISTS `player_stats` (`id` INTEGER NOT NULL, `totalPlayCount` INTEGER NOT NULL, `totalKills` INTEGER NOT NULL, `totalArrowsShot` INTEGER NOT NULL, `totalHitCount` INTEGER NOT NULL, `totalGoldEarned` INTEGER NOT NULL, `totalGoldSpent` INTEGER NOT NULL, `totalSurvivalTime` INTEGER NOT NULL, `maxScore` INTEGER NOT NULL, `maxStage` INTEGER NOT NULL, `maxWave` INTEGER NOT NULL, `totalShopVisits` INTEGER NOT NULL, `totalShopPurchases` INTEGER NOT NULL, `ownedBowsCount` INTEGER NOT NULL, PRIMARY KEY(`id`))")
++        old.execSQL("INSERT INTO game_records VALUES(1,1234,60,800,20,40,30,75,80,10,1,0,2,1,'DEAD',1)")
++        old.execSQL("INSERT INTO achievements VALUES(1,'legacy','preserve','test',1,1,50,1,1)")
++        old.execSQL("INSERT INTO player_stats VALUES(1,7,99,100,90,500,20,600,800,2,3,4,5,3)")
++        old.version=1; old.close()
++        val db=AppDatabase.create(context,name)
++        try {
++            val rows=db.gameDao().getAllRecords()
++            assertEquals(1,rows.size); assertEquals(800,rows[0].score); assertNull(rows[0].sessionId)
++            val stats=db.gameDao().getPlayerStats()!!
++            assertEquals(7,stats.totalPlayCount); assertEquals(3,stats.ownedBowsCount); assertEquals(0,stats.supplyCounted)
++            val cursor=db.openHelper.readableDatabase.query("SELECT isRewardClaimed FROM achievements WHERE id=1")
++            cursor.use { assertTrue(it.moveToFirst()); assertEquals(1,it.getInt(0)) }
++        } finally { db.close(); context.deleteDatabase(name) }
++    }
++    @Test fun repeatedAndContinuedResultsAggregateOnlyDeltas() = runBlocking {
++        val name="ledger-test-${UUID.randomUUID()}"
++        val db=AppDatabase.create(context,name)
++        val prefs="ledger-prefs-${UUID.randomUUID()}"
++        val store=PurchaseStore(context,prefs)
++        val manager=DataManager(context,db,store)
++        try {
++            val s=RunState(time=60.0,kills=10,shots=30,hits=20,gold=50,score=100,ended=true)
++            val record=RunFinalizer.record(s)
++            manager.saveGameRecord(record); manager.saveGameRecord(record)
++            manager.saveGameRecord(record.copy(survivalTimeSeconds=90,killCount=15,score=150,goldEarned=80))
++            val stats=db.gameDao().getPlayerStats()!!
++            assertEquals(1,stats.totalPlayCount); assertEquals(15,stats.totalKills)
++            assertEquals(80,stats.totalGoldEarned); assertEquals(90,stats.totalSurvivalTime)
++            assertEquals(1,db.gameDao().getAllRecords().size)
++            store.commitRunGold(s.sessionId,50); store.commitRunGold(s.sessionId,50); store.commitRunGold(s.sessionId,80)
++            assertEquals(80,store.getGold())
++            store.awardOnce("a",10); store.awardOnce("a",10); assertEquals(90,store.getGold())
++            store.addLives(1); assertTrue(store.reserveContinue(s.sessionId)); assertTrue(store.reserveContinue(s.sessionId)); assertEquals(0,store.getLifeCount())
++            assertTrue(store.buySupply("item_potion",60)); assertFalse(store.buySupply("item_power",90)); assertEquals(30,store.getGold())
++            manager.refreshShopAchievements(); manager.refreshShopAchievements()
++            assertEquals(1,db.gameDao().getPlayerStats()!!.totalShopPurchases)
++            assertEquals(60,db.gameDao().getPlayerStats()!!.totalGoldSpent)
++        } finally { db.close(); context.deleteDatabase(name); context.getSharedPreferences(prefs,0).edit().clear().commit() }
++    }
++}
+--- before/app/src/main/java/com/example/bowdefense/AchievementAdapter.kt
++++ after/app/src/main/java/com/example/bowdefense/AchievementAdapter.kt
+@@ -31,6 +31,7 @@
+         
+         holder.nameText.text = if (nameResId != 0) context.getString(nameResId) else ach.name
+         holder.descText.text = if (descResId != 0) context.getString(descResId) else ach.description
++        holder.descText.append("\n${ach.currentValue}/${ach.targetValue}")
+         holder.rewardText.text = "+${ach.rewardGold}G"
+ 
+         if (ach.isUnlocked) {
+--- before/app/src/main/java/com/example/bowdefense/BattleEngine.kt
++++ after/app/src/main/java/com/example/bowdefense/BattleEngine.kt
+@@ -0,0 +1,190 @@
++package com.example.bowdefense
++
++import java.io.Serializable
++import java.util.UUID
++import kotlin.math.*
++
++/** Pure deterministic simulation. All times are active simulation seconds. */
++data class Enemy(val id: Int, val kind: Int, var x: Double, var y: Double,
++    var hp: Double, val maxHp: Double, var age: Double = 0.0,
++    var chill: Double = 0.0, var burn: Double = 0.0, var stun: Double = 0.0,
++    var flash: Double = 0.0, var summonAt: Double = 7.0) : Serializable
++data class Bolt(var x: Double, var y: Double, val angle: Double, val damage: Double,
++    var pierce: Int, val shock: Boolean = false, var counted: Boolean = false,
++    val hitIds: MutableSet<Int> = mutableSetOf()) : Serializable
++data class Spark(var x: Double, var y: Double, var life: Double, val color: Int) : Serializable
++data class RunState(
++    val sessionId: String = UUID.randomUUID().toString(), val createdAt: Long = System.currentTimeMillis(),
++    var time: Double = 0.0, var waveTime: Double = 0.0, var wave: Int = 1, var aimAngle: Double = 0.0,
++    var spawned: Int = 0, var spawnIn: Double = 1.0, var nextId: Int = 1,
++    var hp: Int = 10, var score: Int = 0, var kills: Int = 0, var shots: Int = 0,
++    var hits: Int = 0, var gold: Int = 0, var lowHpTime: Double = 0.0,
++    var lowHpAchieved: Boolean = false, var power: Double = 0.0, var slow: Double = 0.0,
++    var fireIn: Double = 0.0, var shockIn: Double = 0.0, var shockUses: Int = 0,
++    var nextChoice: Double = 25.0, var firstChoiceAt: Double = -1.0,
++    var combo: Int = 0, var comboTime: Double = 0.0, var bestCombo: Int = 0,
++    var ended: Boolean = false, var cleared: Boolean = false, var continued: Boolean = false, var abandoned: Boolean = false,
++    var deathKind: Int = -1, var archetype: Int = 0, var endless: Boolean = false,
++    var bowMultiplier: Double = 1.0, var seed: Long = 183749L,
++    var previousBest: Int = 0, var potionUses: Int = 0, var powerUses: Int = 0, var slowUses: Int = 0,
++    var goldSpent: Int = 0, var purchases: Int = 0,
++    val levels: IntArray = IntArray(12), val choices: MutableList<Int> = mutableListOf(),
++    val enemies: MutableList<Enemy> = mutableListOf(), val bolts: MutableList<Bolt> = mutableListOf(),
++    val sparks: MutableList<Spark> = mutableListOf()
++) : Serializable
++
++class BattleEngine(val state: RunState = RunState()) {
++    var aiming = false
++    var aim: Double
++        get() = state.aimAngle
++        set(value) { state.aimAngle = value }
++    var shotEvent = false
++    var hitEvent = false
++    var killEvent = false
++    var hurtEvent = false
++    private var accumulator = 0.0
++    private fun random(): Double {
++        state.seed = (state.seed * 1664525L + 1013904223L) and 0xffffffffL
++        return state.seed.toDouble() / 4294967296.0
++    }
++    fun advance(seconds: Double) {
++        if (state.ended || state.choices.isNotEmpty()) { accumulator = 0.0; return }
++        accumulator += seconds.coerceIn(0.0, 0.25)
++        while (accumulator + 1e-9 >= STEP) {
++            accumulator -= STEP
++            tick(STEP)
++            if (state.ended || state.choices.isNotEmpty()) { accumulator = 0.0; break }
++        }
++    }
++    fun availableCards(): List<Int> = (0..11).filter { id ->
++        state.levels[id] < (if (id % 3 == 2) 1 else 3) &&
++            (id % 3 != 2 || (state.levels[id - 2] >= 2 && state.levels[id - 1] >= 1))
++    }
++    private fun offerChoice() {
++        val pool = availableCards().toMutableList()
++        repeat(min(3, pool.size)) { state.choices.add(pool.removeAt((random() * pool.size).toInt())) }
++    }
++    fun choose(id: Int): Boolean {
++        if (id !in state.choices) return false
++        state.levels[id]++
++        state.choices.clear()
++        if (state.firstChoiceAt < 0) state.firstChoiceAt = state.time
++        return true
++    }
++    fun damage(): Double = (1.5 + (state.wave - 1) * 0.42 + state.levels[1] * 0.5) *
++        (if (state.power > 0) 1.5 else 1.0) * (if (state.archetype == 1) 1.3 else 1.0) * (1 + max(0,state.levels[10]-1)*.1)
++    fun cooldown(): Double = (0.5 * state.bowMultiplier * (1 - state.levels[9] * 0.10) *
++        (if (state.archetype == 0) 0.85 else 1.0) * (if (state.levels[11] > 0) 0.65 else 1.0)).coerceAtLeast(0.16)
++    fun shock(): Boolean {
++        if (state.ended || state.choices.isNotEmpty() || state.shockIn > 0) return false
++        state.shockIn = 20.0; state.shockUses++
++        state.bolts.add(Bolt(250.0, 540.0, aim, damage() * 5, 50, true))
++        state.shots++; shotEvent = true
++        return true
++    }
++    fun revive(): Boolean {
++        if (!state.ended || state.cleared || state.continued) return false
++        state.hp = 10; state.ended = false; state.continued = true
++        state.enemies.forEach { it.x = max(650.0, it.x); it.stun = 2.0 }
++        return true
++    }
++    private fun spawn(kind: Int, x: Double = 1820.0, y: Double = 180 + random() * 620) {
++        val base = doubleArrayOf(4.0, 2.8, 13.0, 8.0, 10.0, 190.0)[kind]
++        val hp = base * (1 + (state.wave - 1) * 0.14)
++        state.enemies.add(Enemy(state.nextId++, kind, x, y, hp, hp))
++    }
++    private fun tick(dt: Double) {
++        val s = state
++        s.time += dt; s.waveTime += dt
++        s.power = max(0.0, s.power - dt); s.slow = max(0.0, s.slow - dt)
++        s.shockIn = max(0.0, s.shockIn - dt); s.fireIn -= dt
++        if (s.hp in 1..3) { s.lowHpTime += dt; if (s.lowHpTime >= 30) s.lowHpAchieved = true }
++        else s.lowHpTime = 0.0
++        s.comboTime -= dt; if (s.comboTime <= 0) s.combo = 0
++        if (s.time >= s.nextChoice) { s.nextChoice += 32; offerChoice(); if (s.choices.isNotEmpty()) return }
++        val budget = if (s.wave == 8 && !s.endless) 1 else 8 + s.wave * 2
++        s.spawnIn -= dt
++        if (s.spawned < budget && s.spawnIn <= 0 && s.enemies.size < 18) {
++            val kind = if (s.wave == 8 && !s.endless) 5 else if (s.wave == 4 && s.spawned == 0) 2
++                else { val r = random(); when { s.wave >= 5 && r < .16 -> 4; s.wave >= 3 && r < .35 -> 3; r < .55 -> 1; r > .85 -> 2; else -> 0 } }
++            spawn(kind)
++            if (s.wave == 4 && s.spawned == 0) { val e = s.enemies.last(); e.hp *= 2; s.enemies[s.enemies.lastIndex] = e.copy(maxHp = e.hp) }
++            s.spawned++; s.spawnIn = (28.0 / budget).coerceAtLeast(0.9)
++        }
++        if (aiming && s.fireIn <= 0) {
++            val count = if (s.levels[10] > 0) 2 else 1
++            repeat(count) { i ->
++                val angle = aim + if (count == 2) (i * 2 - 1) * .045 else 0.0
++                s.bolts.add(Bolt(250.0, 540.0, angle, damage(), s.levels[0] + if (s.archetype == 1) 1 else 0))
++                s.shots++
++            }
++            s.fireIn = cooldown(); shotEvent = true
++        }
++        val additions = mutableListOf<Pair<Double, Double>>()
++        for (e in s.enemies.toList()) {
++            e.age += dt; e.flash = max(0.0, e.flash - dt)
++            e.stun = max(0.0, e.stun - dt); e.chill = max(0.0, e.chill - dt)
++            if (e.burn > 0) { e.burn -= dt; e.hp -= dt * (0.8 + s.levels[6] * .6 + s.levels[8]) }
++            var speed = doubleArrayOf(85.0, 145.0, 48.0, 65.0, 55.0, 0.0)[e.kind] * (1 + (s.wave - 1) * .025)
++            if (e.kind == 5) {
++                val phase = e.age % 12
++                // 0–2 windup, 2–4 charge, 4–8 exposed, 8–12 armored recovery.
++                speed = when { e.x > 1350 && phase < 2 -> 240.0; phase in 2.0..4.0 -> 620.0; phase >= 8 && e.x < 1350 -> -280.0; else -> 0.0 }
++                if (e.age >= e.summonAt && s.enemies.size < 16) { additions.add(Pair(e.x, e.y)); e.summonAt += 12 }
++            } else if (e.kind == 4 && e.age >= e.summonAt && s.enemies.size < 16) {
++                additions.add(Pair(e.x + 60, e.y)); e.summonAt += 8
++            }
++            if (e.stun <= 0) e.x -= speed * dt * (if (s.slow > 0 || e.chill > 0) .5 else 1.0)
++            if (e.x < 240) {
++                s.hp = max(0, s.hp - if (e.kind == 5) 3 else if (e.kind == 2) 2 else 1)
++                hurtEvent = true; s.deathKind = e.kind
++                if (e.kind == 5) { e.x = 1000.0; e.age = 8.0 } else s.enemies.remove(e)
++                if (s.hp == 0) { s.ended = true; return }
++            }
++        }
++        additions.forEach { spawn(0, it.first, it.second.coerceIn(180.0, 800.0)) }
++        for (b in s.bolts.toList()) {
++            val oldX = b.x; val oldY = b.y
++            b.x += cos(b.angle) * 1500 * dt; b.y += sin(b.angle) * 1500 * dt
++            for (e in s.enemies.toList()) {
++                if (e.id in b.hitIds || e.hp <= 0) continue
++                val radius = if (e.kind == 5) 125.0 else if (e.kind == 2) 85.0 else 62.0
++                if (distanceToSegment(e.x, e.y, oldX, oldY, b.x, b.y) > radius) continue
++                b.hitIds.add(e.id)
++                if (!b.counted) { s.hits++; b.counted = true }
++                hitEvent = true; e.flash = .12
++                val shield = (e.kind == 3 && e.age % 5 < 3) || (e.kind == 5 && e.age % 12 >= 8)
++                var hit = b.damage * if (shield && !b.shock && s.levels[2] == 0) .35 else 1.0
++                if (e.kind == 5 && (e.age % 12 in 4.0..8.0 || e.stun > 0)) hit *= 1.7
++                e.hp -= hit
++                if (s.levels[3] > 0 || s.archetype == 2) e.chill = 1.0 + s.levels[3]*.5 + s.levels[4]
++                if (s.levels[5] > 0) e.stun = .35
++                if (s.levels[6] > 0) e.burn = 2.0 + s.levels[7]
++                if (b.shock) { e.stun = 2.0; e.x = min(1800.0, e.x + 130) }
++                if (b.pierce-- <= 0) { s.bolts.remove(b); break }
++            }
++            if (b.x > 2000 || b.x < 0 || b.y < 70 || b.y > 1000) s.bolts.remove(b)
++        }
++        for (e in s.enemies.filter { it.hp <= 0 }) {
++            s.enemies.remove(e); s.kills++; killEvent = true
++            s.combo++; s.comboTime = 3.0; s.bestCombo = max(s.bestCombo, s.combo)
++            val points = intArrayOf(10,20,50,30,40,500)[e.kind]
++            s.score += points; s.gold += max(1, points / 5)
++            repeat(6) { s.sparks.add(Spark(e.x + (random() - .5) * 100, e.y + (random() - .5) * 100, .4, e.kind)) }
++            if (s.levels[8] > 0) s.enemies.filter { hypot(it.x-e.x,it.y-e.y)<180 }.forEach { it.burn = 3.0 }
++        }
++        s.sparks.forEach { it.life -= dt; it.y -= dt * 65 }; s.sparks.removeAll { it.life <= 0 }
++        if (s.spawned >= budget && s.enemies.isEmpty() && s.waveTime >= 30) {
++            if (s.wave == 8 && !s.endless) { s.cleared = true; s.ended = true; s.gold += 150 }
++            else { s.wave++; s.waveTime = 0.0; s.spawned = 0; s.spawnIn = 2.0; s.hp = min(10, s.hp + 1); offerChoice() }
++        }
++    }
++    companion object {
++        const val STEP = 1.0 / 60.0
++        fun distanceToSegment(x: Double, y: Double, ax: Double, ay: Double, bx: Double, by: Double): Double {
++            val dx = bx-ax; val dy = by-ay
++            val t = if (dx*dx+dy*dy == 0.0) 0.0 else (((x-ax)*dx+(y-ay)*dy)/(dx*dx+dy*dy)).coerceIn(0.0,1.0)
++            return hypot(x-ax-t*dx,y-ay-t*dy)
++        }
++    }
++}
+--- before/app/src/main/java/com/example/bowdefense/DataManager.kt
++++ after/app/src/main/java/com/example/bowdefense/DataManager.kt
+@@ -1,14 +1,13 @@
+ package com.example.bowdefense
+ 
+ import android.content.Context
++import androidx.room.withTransaction
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.withContext
+ 
+-class DataManager(private val context: Context) {
+-    private val db = AppDatabase.getDatabase(context)
++class DataManager(private val context: Context, private val db: AppDatabase = AppDatabase.getDatabase(context), private val purchaseStore: PurchaseStore = PurchaseStore(context)) {
+     private val dao = db.gameDao()
+-    private val purchaseStore = PurchaseStore(context)
+ 
+     suspend fun initAchievements() {
+         val achievements = listOf(
+@@ -70,21 +69,23 @@
+         dao.insertAchievements(achievements)
+     }
+ 
+-    suspend fun saveGameRecord(record: GameRecord): List<Achievement> {
+-        dao.insertRecord(record)
++    suspend fun saveGameRecord(record: GameRecord): List<Achievement> = db.withTransaction {
++        val previous=record.sessionId?.let { dao.recordForSession(it) }
++        if(previous!=null && previous.survivalTimeSeconds>=record.survivalTimeSeconds && previous.score>=record.score) return@withTransaction emptyList<Achievement>()
++        dao.insertRecord(if(previous!=null) record.copy(id=previous.id) else record)
+         val stats = dao.getPlayerStats() ?: PlayerStats()
+         
+-        stats.totalPlayCount++
+-        stats.totalKills += record.killCount
+-        stats.totalArrowsShot += record.arrowsShot
+-        stats.totalHitCount += record.hitCount
+-        stats.totalGoldEarned += record.goldEarned
+-        stats.totalGoldSpent += record.goldSpent
+-        stats.totalSurvivalTime += record.survivalTimeSeconds
++        if(previous==null) stats.totalPlayCount++
++        stats.totalKills += record.killCount - (previous?.killCount ?: 0)
++        stats.totalArrowsShot += record.arrowsShot - (previous?.arrowsShot ?: 0)
++        stats.totalHitCount += record.hitCount - (previous?.hitCount ?: 0)
++        stats.totalGoldEarned += record.goldEarned - (previous?.goldEarned ?: 0)
++        // Preparation spending is aggregated exactly once by the supply ledger.
++        stats.totalSurvivalTime += record.survivalTimeSeconds - (previous?.survivalTimeSeconds ?: 0)
+         if (record.score > stats.maxScore) stats.maxScore = record.score
+         if (record.maxStage > stats.maxStage) stats.maxStage = record.maxStage
+         if (record.maxWave > stats.maxWave) stats.maxWave = record.maxWave
+-        stats.totalShopPurchases += record.shopPurchaseCount
++        // Do not count preparation purchases again when a battle finishes.
+         
+         // ownedBowsCount update
+         var ownedCount = 0
+@@ -94,7 +95,7 @@
+ 
+         dao.updatePlayerStats(stats)
+ 
+-        return checkAchievements(record, stats)
++        checkAchievements(record, stats)
+     }
+ 
+     private suspend fun checkAchievements(record: GameRecord, stats: PlayerStats): List<Achievement> {
+@@ -102,7 +103,10 @@
+         val newlyUnlocked = mutableListOf<Achievement>()
+ 
+         allAchievements.forEach { achievement ->
+-            if (achievement.isUnlocked) return@forEach
++            if (achievement.isUnlocked) {
++                if(achievement.currentValue != achievement.targetValue) { achievement.currentValue=achievement.targetValue; dao.updateAchievement(achievement) }
++                return@forEach
++            }
+ 
+             var isUnlockedNow = false
+             when (achievement.id) {
+@@ -168,10 +172,33 @@
+                 54 -> if (purchaseStore.getItemStat("stat_use_item_potion_at_hp1") >= 1) isUnlockedNow = true
+             }
+ 
++            val progress = when(achievement.id) {
++                1,37,38,39,40 -> stats.totalPlayCount
++                2,8,9,10,11 -> stats.totalKills
++                3,18,19,20 -> stats.totalHitCount
++                4,5,6,7 -> record.survivalTimeSeconds
++                12,13,14 -> record.killCount
++                15,16,17 -> record.accuracy.toInt()
++                21 -> stats.totalShopVisits
++                22,23,24 -> stats.totalShopPurchases
++                27,28 -> stats.ownedBowsCount
++                29,30,31 -> stats.totalGoldEarned
++                32,33,34,35,36 -> record.score
++                41,42 -> record.maxStage
++                43,44 -> (record.maxStage-1)*3+record.maxWave
++                45 -> if(record.shopPurchaseCount==0) record.survivalTimeSeconds else 0
++                46 -> if(record.goldSpent==0) record.survivalTimeSeconds else 0
++                51 -> purchaseStore.getItemStat("stat_use_item_potion")
++                52 -> purchaseStore.getItemStat("stat_use_item_power")
++                53 -> purchaseStore.getItemStat("stat_use_item_slow")
++                else -> if(isUnlockedNow) achievement.targetValue else 0
++            }
++            achievement.currentValue=maxOf(achievement.currentValue,progress.coerceAtMost(achievement.targetValue))
++            dao.updateAchievement(achievement)
+             if (isUnlockedNow) {
+                 achievement.isUnlocked = true
+                 if (!achievement.isRewardClaimed) {
+-                    purchaseStore.addGold(achievement.rewardGold)
++                    purchaseStore.awardOnce("achievement_${achievement.id}",achievement.rewardGold)
+                     achievement.isRewardClaimed = true
+                 }
+                 withContext(Dispatchers.IO) {
+@@ -183,9 +210,24 @@
+         return newlyUnlocked
+     }
+     
+-    suspend fun incrementShopVisit() {
++    suspend fun incrementShopVisit() = db.withTransaction {
+         val stats = dao.getPlayerStats() ?: PlayerStats()
+         stats.totalShopVisits++
+         dao.updatePlayerStats(stats)
++        refreshShopAchievements()
++    }
++
++    suspend fun refreshShopAchievements() = db.withTransaction {
++        val stats=dao.getPlayerStats() ?: PlayerStats()
++        val old=context.getSharedPreferences("BowDefensePrefs",0)
++        val counted=stats.supplyCounted
++        val spent=stats.supplySpentCounted
++        stats.totalShopPurchases += (purchaseStore.supplyPurchases()-counted).coerceAtLeast(0)
++        stats.totalGoldSpent += (purchaseStore.supplySpent()-spent).coerceAtLeast(0)
++        stats.supplyCounted=purchaseStore.supplyPurchases()
++        stats.supplySpentCounted=purchaseStore.supplySpent()
++        dao.updatePlayerStats(stats)
++        val record=GameRecord(playDate=0,survivalTimeSeconds=0,score=0,killCount=0,arrowsShot=0,hitCount=0,accuracy=0f,goldEarned=0,goldSpent=0,shopPurchaseCount=0,bowChangeCount=0,maxStage=1,maxWave=1,resultType="SHOP")
++        checkAchievements(record,stats)
+     }
+ }
+--- before/app/src/main/java/com/example/bowdefense/Database.kt
++++ after/app/src/main/java/com/example/bowdefense/Database.kt
+@@ -4,7 +4,7 @@
+ import androidx.room.*
+ import kotlinx.coroutines.flow.Flow
+ 
+-@Entity(tableName = "game_records")
++@Entity(tableName = "game_records", indices = [Index(value = ["sessionId"], unique = true)])
+ data class GameRecord(
+     @PrimaryKey(autoGenerate = true) val id: Long = 0,
+     val playDate: Long,
+@@ -21,7 +21,8 @@
+     val maxStage: Int,
+     val maxWave: Int,
+     val resultType: String, // e.g., "DEAD", "EXIT"
+-    val isLowHpSurvivalAchieved: Boolean = false
++    val isLowHpSurvivalAchieved: Boolean = false,
++    val sessionId: String? = null
+ )
+ 
+ @Entity(tableName = "achievements")
+@@ -52,12 +53,17 @@
+     var maxWave: Int = 1,
+     var totalShopVisits: Int = 0,
+     var totalShopPurchases: Int = 0,
+-    var ownedBowsCount: Int = 1
++    var ownedBowsCount: Int = 1,
++    @ColumnInfo(defaultValue="0") var supplyCounted: Int = 0,
++    @ColumnInfo(defaultValue="0") var supplySpentCounted: Int = 0
+ )
+ 
+ @Dao
+ interface GameDao {
+-    @Insert
++    @Query("SELECT * FROM game_records WHERE sessionId = :session LIMIT 1")
++    suspend fun recordForSession(session: String): GameRecord?
++
++    @Insert(onConflict = OnConflictStrategy.REPLACE)
+     suspend fun insertRecord(record: GameRecord)
+ 
+     @Query("SELECT * FROM game_records ORDER BY playDate DESC LIMIT 10")
+@@ -88,7 +94,7 @@
+     fun getUnlockedCount(): Flow<Int>
+ }
+ 
+-@Database(entities = [GameRecord::class, Achievement::class, PlayerStats::class], version = 1)
++@Database(entities = [GameRecord::class, Achievement::class, PlayerStats::class], version = 3)
+ abstract class AppDatabase : RoomDatabase() {
+     abstract fun gameDao(): GameDao
+ 
+@@ -98,14 +104,25 @@
+ 
+         fun getDatabase(context: Context): AppDatabase {
+             return INSTANCE ?: synchronized(this) {
+-                val instance = Room.databaseBuilder(
+-                    context.applicationContext,
+-                    AppDatabase::class.java,
+-                    "BowDefense_database"
+-                ).build()
++                val instance = create(context,"BowDefense_database")
+                 INSTANCE = instance
+                 instance
+             }
+         }
++        fun create(context: Context, name: String): AppDatabase = Room.databaseBuilder(
++                    context.applicationContext,
++                    AppDatabase::class.java,
++                    name
++                ).addMigrations(object: androidx.room.migration.Migration(1,2) {
++                    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
++                        db.execSQL("ALTER TABLE game_records ADD COLUMN sessionId TEXT")
++                        db.execSQL("CREATE UNIQUE INDEX index_game_records_sessionId ON game_records(sessionId)")
++                    }
++                }, object: androidx.room.migration.Migration(2,3) {
++                    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
++                        db.execSQL("ALTER TABLE player_stats ADD COLUMN supplyCounted INTEGER NOT NULL DEFAULT 0")
++                        db.execSQL("ALTER TABLE player_stats ADD COLUMN supplySpentCounted INTEGER NOT NULL DEFAULT 0")
++                    }
++                }).build()
+     }
+ }
+--- before/app/src/main/java/com/example/bowdefense/GameActivity.kt
++++ after/app/src/main/java/com/example/bowdefense/GameActivity.kt
+@@ -1,394 +1,126 @@
+ package com.example.bowdefense
+-
+ import android.content.Intent
+ import android.os.Bundle
+-import android.util.Log
+ import android.view.View
+-import android.widget.Button
+-import android.widget.LinearLayout
+-import android.widget.ProgressBar
+-import android.widget.TextView
+-import android.widget.Toast
++import android.widget.*
+ import androidx.appcompat.app.AlertDialog
+ import androidx.lifecycle.lifecycleScope
+-import com.google.android.gms.ads.AdRequest
+-import com.google.android.gms.ads.FullScreenContentCallback
+-import com.google.android.gms.ads.LoadAdError
+-import com.google.android.gms.ads.interstitial.InterstitialAd
+-import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
+ import kotlinx.coroutines.launch
+ 
+-class GameActivity : BaseActivity() {
+-
+-    private lateinit var gameView: GameView
+-    private lateinit var stageTextView: TextView
+-    private lateinit var scoreTextView: TextView
+-    private lateinit var hpProgressBar: ProgressBar
+-    private lateinit var upgradeMessage: TextView
+-    
+-    private lateinit var pauseButton: Button
+-    private lateinit var pauseScreen: LinearLayout
+-    private lateinit var resumeButton: Button
+-    private lateinit var settingsButtonInGame: Button
+-    private lateinit var exitButton: Button
+-    
+-    private lateinit var soundManager: SoundManager
+-    private lateinit var saveManager: SaveManager
+-    private lateinit var purchaseStore: PurchaseStore
+-    private lateinit var dataManager: DataManager
+-    private var isGamePaused = false
+-    private var isGameOverProcessed = false
+-
+-    // 아이템 UI
+-    private lateinit var slotPotion: View
+-    private lateinit var slotPower: View
+-    private lateinit var slotSlow: View
+-    private lateinit var countPotion: TextView
+-    private lateinit var countPower: TextView
+-    private lateinit var countSlow: TextView
+-    private lateinit var powerArrowTimer: TextView
+-    private lateinit var slowStoneTimer: TextView
+-
+-    // 전면 광고
+-    private var mInterstitialAd: InterstitialAd? = null
+-    private val TAG = "GameActivity"
+-
++class GameActivity: BaseActivity() {
++    private lateinit var game: GameView
++    private lateinit var sound: SoundManager
++    private lateinit var store: PurchaseStore
++    private lateinit var repository: RunRepository
++    private lateinit var shock: Button
++    private var paused=false
++    private var finished=false
++    private var choiceDialog: AlertDialog?=null
+     override fun onCreate(savedInstanceState: Bundle?) {
+-        super.onCreate(savedInstanceState)
+-        setContentView(R.layout.activity_game)
+-
+-        soundManager = SoundManager(this)
+-        saveManager = SaveManager(this)
+-        purchaseStore = PurchaseStore(this)
+-        dataManager = DataManager(this)
+-
+-        gameView = findViewById(R.id.gameView)
+-        stageTextView = findViewById(R.id.stageTextView)
+-        scoreTextView = findViewById(R.id.scoreTextView)
+-        hpProgressBar = findViewById(R.id.hpProgressBar)
+-        upgradeMessage = findViewById(R.id.upgradeMessage)
+-        
+-        pauseButton = findViewById(R.id.pauseButton)
+-        pauseScreen = findViewById(R.id.pauseScreen)
+-        resumeButton = findViewById(R.id.resumeButton)
+-        settingsButtonInGame = findViewById(R.id.settingsButtonInGame)
+-        exitButton = findViewById(R.id.exitButton)
+-
+-        // 아이템 슬롯 초기화
+-        slotPotion = findViewById(R.id.slotPotion)
+-        slotPower = findViewById(R.id.slotPower)
+-        slotSlow = findViewById(R.id.slotSlow)
+-        countPotion = findViewById(R.id.countPotion)
+-        countPower = findViewById(R.id.countPower)
+-        countSlow = findViewById(R.id.countSlow)
+-        powerArrowTimer = findViewById(R.id.powerArrowTimer)
+-        slowStoneTimer = findViewById(R.id.slowStoneTimer)
+-
+-        initItemListeners()
+-
+-        // 초기 광고 로드
+-        loadInterstitialAd()
+-
+-        pauseButton.setOnClickListener { pauseGame() }
+-        resumeButton.setOnClickListener { resumeGame() }
+-        settingsButtonInGame.setOnClickListener { showSettingsDialog() }
+-        
+-        exitButton.setOnClickListener {
+-            saveManager.saveHighScore(gameView.score)
+-            showInterstitialAd { finish() }
++        super.onCreate(savedInstanceState); setContentView(R.layout.activity_game)
++        onBackPressedDispatcher.addCallback(this,object: androidx.activity.OnBackPressedCallback(true) {
++            override fun handleOnBackPressed() { if(paused) resumeBattle() else pauseBattle() }
++        })
++        store=PurchaseStore(this); repository=RunRepository(this); sound=SoundManager(this)
++        game=findViewById(R.id.gameView); game.setSoundManager(sound)
++        val restored=if(savedInstanceState!=null || intent.getBooleanExtra("RESUME_RUN",false) || intent.getBooleanExtra("CONTINUE_GAME",false)) repository.load() else null
++        val state=restored ?: RunState(archetype=intent.getIntExtra("ARCHETYPE",0),endless=intent.getBooleanExtra("ENDLESS",false),previousBest=store.getHighScore(),bowMultiplier=when(store.getEquippedBow()) { "bow"->1.0; "high_bow"->.7; else->.8 })
++        if(intent.getBooleanExtra("CONTINUE_GAME",false) && state.ended && store.reserveContinue(state.sessionId)) { BattleEngine(state).revive(); repository.save(state) }
++        if(restored==null) {
++            state.goldSpent=store.preparationSpent(); state.purchases=store.preparationPurchases()
++            repository.save(state); store.markPreparationUsed(); store.incrementItemStat("v2_runs")
+         }
+-
+-        gameView.setSoundManager(soundManager)
+-
+-        // 이어하기 체크
+-        val isContinue = intent.getBooleanExtra("CONTINUE_GAME", false)
+-        if (isContinue) {
+-            val lastScore = intent.getIntExtra("LAST_SCORE", 0)
+-            val lastStage = intent.getIntExtra("LAST_STAGE", 1)
+-            val lastWave = intent.getIntExtra("LAST_WAVE", 1)
+-            val cumulativeKills = intent.getIntExtra("CUMULATIVE_KILLS", 0)
+-            val currentDamage = intent.getIntExtra("CURRENT_DAMAGE", 1)
+-            val fireCooldown = intent.getLongExtra("FIRE_COOLDOWN", Config.BASE_FIRE_COOLDOWN)
+-            
+-            gameView.post {
+-                gameView.revive(lastScore, lastStage, lastWave, cumulativeKills, currentDamage, fireCooldown)
++        game.configure(state)
++        findViewById<Button>(R.id.pauseButton).setOnClickListener { pauseBattle() }
++        findViewById<Button>(R.id.resumeButton).setOnClickListener { resumeBattle() }
++        findViewById<Button>(R.id.settingsButtonInGame).setOnClickListener { settings() }
++        findViewById<Button>(R.id.exitButton).setOnClickListener { game.checkpoint(); finish() }
++        findViewById<LinearLayout>(R.id.pauseScreen).addView(Button(this).apply {
++            layoutParams=LinearLayout.LayoutParams((180*resources.displayMetrics.density).toInt(),LinearLayout.LayoutParams.WRAP_CONTENT)
++            backgroundTintList=android.content.res.ColorStateList.valueOf(0xFF176B70.toInt())
++            setTextColor(android.graphics.Color.WHITE)
++            text=getString(R.string.choose_upgrade)
++            setOnClickListener {
++                val names=resources.getStringArray(R.array.card_names)
++                val descriptions=resources.getStringArray(R.array.card_descriptions)
++                val levels=game.snapshot().levels
++                AlertDialog.Builder(this@GameActivity,R.style.BattleDialog).setTitle(R.string.choose_upgrade)
++                    .setItems(names.indices.map { "${names[it]} ${levels[it]}/${if(it%3==2) 1 else 3}\n${descriptions[it]}" }.toTypedArray()) { _,_ -> }.show()
++            }
++        })
++        findViewById<View>(R.id.slotPotion).setOnClickListener { game.useItem("item_potion") }
++        findViewById<View>(R.id.slotPower).setOnClickListener { game.useItem("item_power") }
++        findViewById<View>(R.id.slotSlow).setOnClickListener { game.useItem("item_slow") }
++        shock=Button(this).apply {
++            text=getString(R.string.shock_ready)
++            backgroundTintList=android.content.res.ColorStateList.valueOf(0xFF176B70.toInt())
++            setTextColor(android.graphics.Color.WHITE)
++            setOnClickListener { game.command { it.shock() } }
++        }
++        findViewById<LinearLayout>(R.id.itemSlotsLayout).addView(shock,0)
++        game.onHud={ updateHud(it) }
++        game.onChoice={ cards ->
++            if(!isFinishing && choiceDialog?.isShowing!=true) {
++                val s=game.snapshot()
++                val names=resources.getStringArray(R.array.card_names); val desc=resources.getStringArray(R.array.card_descriptions)
++                choiceDialog=AlertDialog.Builder(this,R.style.BattleDialog).setTitle(R.string.choose_upgrade)
++                    .setItems(cards.map { "${names[it]}  ${s.levels[it]}/${if(it%3==2) 1 else 3}\n${desc[it]}" }.toTypedArray()) { _,i -> game.choose(cards[i]) }
++                    .setCancelable(false).show()
+             }
+         }
+-
+-        gameView.onStateChanged = { runOnUiThread { updateUI() } }
+-
+-        gameView.onUpgrade = { message ->
+-            runOnUiThread {
+-                upgradeMessage.text = message
+-                upgradeMessage.visibility = View.VISIBLE
+-                upgradeMessage.postDelayed({ upgradeMessage.visibility = View.GONE }, 2000)
+-            }
++        game.onFinished={ finishRun(it) }
++        updateHud(state)
++        paused=savedInstanceState?.getBoolean("paused",false) ?: false
++        if(paused) findViewById<View>(R.id.pauseScreen).visibility=View.VISIBLE
++    }
++    private fun updateHud(s: RunState) {
++        findViewById<TextView>(R.id.stageTextView).text=getString(R.string.battle_wave,s.wave,if(s.endless) "∞" else "8",s.time.toInt())
++        findViewById<TextView>(R.id.scoreTextView).text=getString(R.string.score_label,s.score)
++        findViewById<ProgressBar>(R.id.hpProgressBar).apply { max=10; progress=s.hp }
++        listOf(Triple(R.id.slotPotion,R.id.countPotion,"item_potion"),Triple(R.id.slotPower,R.id.countPower,"item_power"),Triple(R.id.slotSlow,R.id.countSlow,"item_slow")).forEach { (slot,count,id) ->
++            val n=store.getItemCount(id); findViewById<View>(slot).visibility=if(n>0) View.VISIBLE else View.GONE
++            findViewById<TextView>(count).text="×$n"
+         }
+-
+-        // 게임 오버 시 광고 노출
+-        gameView.onGameOver = { finalScore ->
+-            if (!isGameOverProcessed) {
+-                isGameOverProcessed = true
+-                saveManager.saveHighScore(finalScore)
+-                
+-                lifecycleScope.launch {
+-                    val accuracy = if (gameView.arrowsShot > 0) {
+-                        (gameView.hitCount.toFloat() / gameView.arrowsShot.toFloat()) * 100f
+-                    } else 0f
+-
+-                    val record = GameRecord(
+-                        playDate = System.currentTimeMillis(),
+-                        survivalTimeSeconds = ((System.currentTimeMillis() - gameView.gameStartTime) / 1000).toInt(),
+-                        score = finalScore,
+-                        killCount = gameView.killCount,
+-                        arrowsShot = gameView.arrowsShot,
+-                        hitCount = gameView.hitCount,
+-                        accuracy = accuracy,
+-                        goldEarned = gameView.goldEarned,
+-                        goldSpent = gameView.goldSpent,
+-                        shopPurchaseCount = gameView.shopPurchaseCount,
+-                        bowChangeCount = 0, 
+-                        maxStage = gameView.stageManager.currentStage,
+-                        maxWave = gameView.stageManager.currentWave,
+-                        resultType = "DEAD",
+-                        isLowHpSurvivalAchieved = gameView.isLowHpSurvivalAchieved
+-                    )
+-                    val newAchievements = dataManager.saveGameRecord(record)
+-                    
+-                    runOnUiThread {
+-                        showInterstitialAd {
+-                            val intent = Intent(this@GameActivity, ResultActivity::class.java).apply {
+-                                putExtra("SCORE", finalScore)
+-                                putExtra("STAGE", gameView.stageManager.currentStage)
+-                                putExtra("WAVE", gameView.stageManager.currentWave)
+-                                putExtra("KILLS", gameView.killCount)
+-                                putExtra("ACCURACY", accuracy)
+-                                putExtra("SURVIVAL_TIME", record.survivalTimeSeconds)
+-                                putExtra("GOLD_EARNED", gameView.goldEarned)
+-                                // Pass new achievements as IDs
+-                                putIntegerArrayListExtra("NEW_ACHIEVEMENTS", ArrayList(newAchievements.map { it.id }))
+-                                
+-                                putExtra("CUMULATIVE_KILLS", gameView.upgradeManager.cumulativeKills)
+-                                putExtra("CURRENT_DAMAGE", gameView.player.currentDamage)
+-                                putExtra("FIRE_COOLDOWN", gameView.player.fireCooldown)
+-                            }
+-                            startActivity(intent)
+-                            finish()
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        updateUI()
++        findViewById<TextView>(R.id.powerArrowTimer).apply { visibility=if(s.power>0) View.VISIBLE else View.GONE; text=getString(R.string.power_arrow_timer,kotlin.math.ceil(s.power).toInt()) }
++        findViewById<TextView>(R.id.slowStoneTimer).apply { visibility=if(s.slow>0) View.VISIBLE else View.GONE; text=getString(R.string.slow_stone_timer,kotlin.math.ceil(s.slow).toInt()) }
++        shock.text=if(s.shockIn<=0) getString(R.string.shock_ready) else getString(R.string.shock_wait,kotlin.math.ceil(s.shockIn).toInt())
++        shock.isEnabled=s.shockIn<=0 && !s.ended && s.choices.isEmpty()
+     }
+-
+-    private fun showSettingsDialog() {
+-        val bgmStatus = if (purchaseStore.isBgmEnabled()) getString(R.string.on) else getString(R.string.off)
+-        val vibStatus = if (purchaseStore.isVibrationEnabled()) getString(R.string.on) else getString(R.string.off)
+-
+-        val options = arrayOf(
+-            getString(R.string.change_language),
+-            "${getString(R.string.bgm_setting)}: $bgmStatus",
+-            "${getString(R.string.vibration_setting)}: $vibStatus"
+-        )
+-
+-        AlertDialog.Builder(this)
+-            .setTitle(R.string.settings)
+-            .setItems(options) { _, which ->
+-                when (which) {
+-                    0 -> showLanguageDialog()
+-                    1 -> {
+-                        val enabled = !purchaseStore.isBgmEnabled()
+-                        purchaseStore.setBgmEnabled(enabled)
+-                        if (enabled) soundManager.startBGM() else soundManager.pauseBGM()
+-                        showSettingsDialog()
+-                    }
+-                    2 -> {
+-                        purchaseStore.setVibrationEnabled(!purchaseStore.isVibrationEnabled())
+-                        showSettingsDialog()
+-                    }
+-                }
+-            }
+-            .show()
+-    }
+-
+-    private fun showLanguageDialog() {
+-        val languages = arrayOf("English (영어)", "한국어 (Korean)", "Español", "中文", "日本語")
+-        val langCodes = arrayOf("en", "ko", "es", "zh", "ja")
+-
+-        AlertDialog.Builder(this)
+-            .setTitle(R.string.select_language)
+-            .setItems(languages) { _, which ->
+-                val selectedLang = langCodes[which]
+-                LocaleHelper.setLocale(this, selectedLang)
+-                // In game language change - better to recreate but might lose temporary state if not handled.
+-                // However, current GameActivity doesn't save all monster positions.
+-                // To minimize loss, we just recreate.
+-                recreate()
+-            }
+-            .show()
+-    }
+-
+-    private fun updateUI() {
+-        stageTextView.text = getString(R.string.stage_wave, gameView.stageManager.currentStage, gameView.stageManager.currentWave)
+-        scoreTextView.text = getString(R.string.score_label, gameView.score)
+-        val currentHp = gameView.player.hp
+-        hpProgressBar.max = Config.PLAYER_MAX_HP
+-        hpProgressBar.progress = currentHp
+-
+-        updateItemUI()
+-    }
+-
+-    private fun updateItemUI() {
+-        val potionCount = purchaseStore.getItemCount("item_potion")
+-        val powerCount = purchaseStore.getItemCount("item_power")
+-        val slowCount = purchaseStore.getItemCount("item_slow")
+-
+-        slotPotion.visibility = if (potionCount > 0) View.VISIBLE else View.GONE
+-        countPotion.text = getString(R.string.battle_item_count_short, potionCount)
+-
+-        slotPower.visibility = if (powerCount > 0) View.VISIBLE else View.GONE
+-        countPower.text = getString(R.string.battle_item_count_short, powerCount)
+-
+-        slotSlow.visibility = if (slowCount > 0) View.VISIBLE else View.GONE
+-        countSlow.text = getString(R.string.battle_item_count_short, slowCount)
+-
+-        // 타이머 업데이트
+-        if (gameView.isPowerArrowActive) {
+-            powerArrowTimer.visibility = View.VISIBLE
+-            powerArrowTimer.text = getString(R.string.power_arrow_timer, (gameView.powerArrowTimeLeft / 1000 + 1).toInt())
+-        } else {
+-            powerArrowTimer.visibility = View.GONE
+-        }
+-
+-        if (gameView.isSlowStoneActive) {
+-            slowStoneTimer.visibility = View.VISIBLE
+-            slowStoneTimer.text = getString(R.string.slow_stone_timer, (gameView.slowStoneTimeLeft / 1000 + 1).toInt())
+-        } else {
+-            slowStoneTimer.visibility = View.GONE
++    private fun finishRun(s: RunState) {
++        if(finished) return; finished=true
++        game.pause(); sound.pauseBGM()
++        lifecycleScope.launch {
++            val record=GameRecord(playDate=s.createdAt,survivalTimeSeconds=s.time.toInt(),score=s.score,killCount=s.kills,arrowsShot=s.shots,hitCount=s.hits,
++                accuracy=if(s.shots>0) s.hits*100f/s.shots else 0f,goldEarned=s.gold,goldSpent=s.goldSpent,shopPurchaseCount=s.purchases,bowChangeCount=0,
++                maxStage=(s.wave-1)/3+1,maxWave=(s.wave-1)%3+1,resultType=if(s.cleared) "CLEAR" else "DEAD",isLowHpSurvivalAchieved=s.lowHpAchieved,sessionId=s.sessionId)
++            val achievements=RunFinalizer.finish(this@GameActivity,s)
++            store.commitRunGold(s.sessionId,s.gold); store.saveHighScore(s.score)
++            if(s.cleared) store.setChapterCleared()
++            startActivity(Intent(this@GameActivity,ResultActivity::class.java).apply {
++                putExtra("SCORE",s.score); putExtra("STAGE",record.maxStage); putExtra("WAVE",record.maxWave); putExtra("KILLS",s.kills)
++                putExtra("ACCURACY",record.accuracy); putExtra("SURVIVAL_TIME",record.survivalTimeSeconds); putExtra("GOLD_EARNED",s.gold)
++                putExtra("RUN_V2",true); putExtra("CLEARED",s.cleared); putExtra("PREVIOUS_BEST",s.previousBest)
++                putExtra("BUILD",s.levels); putExtra("DEATH_KIND",s.deathKind); putExtra("SHOCK_USES",s.shockUses)
++                putIntegerArrayListExtra("NEW_ACHIEVEMENTS",ArrayList(achievements.map { it.id }))
++            }); finish()
+         }
+     }
++    private fun settings() {
++        val options=arrayOf(getString(R.string.change_language),getString(R.string.bgm_setting),getString(R.string.vibration_setting),getString(R.string.screen_shake))
++        AlertDialog.Builder(this,R.style.BattleDialog).setTitle(R.string.settings).setItems(options) { _,i -> when(i) {
++            0->AlertDialog.Builder(this,R.style.BattleDialog).setTitle(R.string.select_language).setItems(arrayOf("English","한국어","Español","中文","日本語")) { _,j ->
++                game.checkpoint(); LocaleHelper.setLocale(this,arrayOf("en","ko","es","zh","ja")[j]); intent.putExtra("RESUME_RUN",true); recreate()
++            }.show()
++            1->store.setBgmEnabled(!store.isBgmEnabled())
++            2->store.setVibrationEnabled(!store.isVibrationEnabled())
++            3->store.setShakeEnabled(!store.isShakeEnabled())
++        } }.show()
++    }
++    private fun pauseBattle() { paused=true; game.pause(); sound.pauseBGM(); findViewById<View>(R.id.pauseScreen).visibility=View.VISIBLE }
++    private fun resumeBattle() { paused=false; findViewById<View>(R.id.pauseScreen).visibility=View.GONE; game.resume(); sound.startBGM() }
++    override fun onSaveInstanceState(outState: Bundle) { game.checkpoint(); outState.putBoolean("paused",paused); super.onSaveInstanceState(outState) }
++    override fun onPause() { game.pause(); sound.pauseBGM(); super.onPause() }
++    override fun onResume() { super.onResume(); if(!paused && !finished) { game.resume(); sound.startBGM() } }
++    override fun onDestroy() { game.pause(); choiceDialog?.dismiss(); sound.release(); super.onDestroy() }
++}
+ 
+-    private fun initItemListeners() {
+-        slotPotion.setOnClickListener {
+-            if (gameView.player.hp < Config.PLAYER_MAX_HP) {
+-                if (purchaseStore.useItem("item_potion")) {
+-                    if (gameView.player.hp == 1) {
+-                        purchaseStore.incrementItemStat("stat_use_item_potion_at_hp1")
+-                    }
+-                    gameView.player.hp = (gameView.player.hp + 1).coerceAtMost(Config.PLAYER_MAX_HP)
+-                    purchaseStore.incrementItemStat("stat_use_item_potion")
+-                    gameView.onUpgrade?.invoke(getString(R.string.hp_recovered))
+-                    updateUI()
+-                }
+-            } else {
+-                Toast.makeText(this, getString(R.string.hp_full_toast), Toast.LENGTH_SHORT).show()
+-            }
+-        }
+-
+-        slotPower.setOnClickListener {
+-            if (!gameView.isPowerArrowActive) {
+-                if (purchaseStore.useItem("item_power")) {
+-                    gameView.isPowerArrowActive = true
+-                    gameView.powerArrowTimeLeft = 20000L
+-                    purchaseStore.incrementItemStat("stat_use_item_power")
+-                    updateUI()
+-                }
+-            } else {
+-                Toast.makeText(this, getString(R.string.power_arrow_active_toast), Toast.LENGTH_SHORT).show()
+-            }
+-        }
+-
+-        slotSlow.setOnClickListener {
+-            if (!gameView.isSlowStoneActive) {
+-                if (purchaseStore.useItem("item_slow")) {
+-                    gameView.isSlowStoneActive = true
+-                    gameView.slowStoneTimeLeft = 10000L
+-                    purchaseStore.incrementItemStat("stat_use_item_slow")
+-                    updateUI()
+-                }
+-            } else {
+-                Toast.makeText(this, getString(R.string.slow_stone_active_toast), Toast.LENGTH_SHORT).show()
+-            }
+-        }
+-    }
+-
+-    private fun loadInterstitialAd() {
+-        val adRequest = AdRequest.Builder().build()
+-        InterstitialAd.load(this, "REDACTED_AD_IDENTIFIER", adRequest, 
+-            object : InterstitialAdLoadCallback() {
+-                override fun onAdLoaded(interstitialAd: InterstitialAd) {
+-                    mInterstitialAd = interstitialAd
+-                    Log.d(TAG, "Ad Loaded Successfully")
+-                }
+-                override fun onAdFailedToLoad(adError: LoadAdError) {
+-                    mInterstitialAd = null
+-                    Log.e(TAG, "Ad Failed to Load: ${adError.message}")
+-                }
+-            })
+-    }
+-
+-    private fun showInterstitialAd(onAdDismissed: () -> Unit) {
+-        if (mInterstitialAd != null) {
+-            mInterstitialAd?.fullScreenContentCallback = object : FullScreenContentCallback() {
+-                override fun onAdDismissedFullScreenContent() {
+-                    mInterstitialAd = null
+-                    loadInterstitialAd()
+-                    onAdDismissed()
+-                }
+-                override fun onAdFailedToShowFullScreenContent(adError: com.google.android.gms.ads.AdError) {
+-                    mInterstitialAd = null
+-                    onAdDismissed()
+-                }
+-            }
+-            mInterstitialAd?.show(this)
+-        } else {
+-            onAdDismissed()
+-            loadInterstitialAd()
+-        }
+-    }
+-
+-    private fun pauseGame() {
+-        isGamePaused = true
+-        gameView.pause()
+-        soundManager.pauseBGM()
+-        pauseScreen.visibility = View.VISIBLE
+-    }
+-
+-    private fun resumeGame() {
+-        isGamePaused = false
+-        pauseScreen.visibility = View.GONE
+-        gameView.resume()
+-        soundManager.startBGM()
+-    }
+-
+-    override fun onPause() {
+-        super.onPause()
+-        if (!isGamePaused) {
+-            gameView.pause()
+-            soundManager.pauseBGM()
+-        }
+-    }
+-
+-    override fun onResume() {
+-        super.onResume()
+-        if (!isGamePaused) {
+-            gameView.resume()
+-            soundManager.startBGM()
+-        }
+-    }
+-
+-    override fun onDestroy() {
+-        super.onDestroy()
+-        soundManager.release()
+-    }
+-
+-    override fun onBackPressed() {
+-        if (pauseScreen.visibility == View.VISIBLE) {
+-            resumeGame()
+-        } else {
+-            pauseGame()
+-        }
+-    }
+-}
+--- before/app/src/main/java/com/example/bowdefense/GameView.kt
++++ after/app/src/main/java/com/example/bowdefense/GameView.kt
+@@ -1,479 +1,148 @@
+ package com.example.bowdefense
+-
+ import android.content.Context
+ import android.graphics.*
+-import android.os.Build
+-import android.os.VibrationEffect
+-import android.os.Vibrator
++import android.os.*
+ import android.util.AttributeSet
+-import android.util.Log
+-import android.view.MotionEvent
+-import android.view.SurfaceHolder
+-import android.view.SurfaceView
+-import java.util.concurrent.CopyOnWriteArrayList
++import android.view.*
++import java.util.concurrent.ConcurrentLinkedQueue
+ import kotlin.math.*
+ 
+-class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(context, attrs), SurfaceHolder.Callback, Runnable {
+-
+-    private var gameThread: Thread? = null
+-    @Volatile private var isPlaying = false
+-    private var isSurfaceCreated = false
+-    private val holder: SurfaceHolder = getHolder()
+-
+-    private val arrows = CopyOnWriteArrayList<Arrow>()
+-    private val monsters = CopyOnWriteArrayList<Monster>()
+-    var player = Player()
+-
+-    val stageManager = StageManager()
+-    val upgradeManager = UpgradeManager()
+-    val purchaseStore = PurchaseStore(context)
+-    
+-    private var soundManager: SoundManager? = null
+-    private val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+-
+-    private var backgroundBitmap: Bitmap? = null
+-    private var bowBitmap: Bitmap? = null
+-    private var normalBitmap: Bitmap? = null
+-    private var fastBitmap: Bitmap? = null
+-    private var tankBitmap: Bitmap? = null
+-
+-    private var bowX = 250f
+-    private var bowY = 0f
+-    private var bowAngle = 0f
+-    private val BOW_SIZE = 672f 
+-
+-    private val arrowPaint = Paint().apply { 
+-        color = Color.WHITE
+-        strokeWidth = 12f 
+-        strokeCap = Paint.Cap.ROUND 
++class GameView(context: Context, attrs: AttributeSet?=null): SurfaceView(context,attrs), SurfaceHolder.Callback,Runnable {
++    private var engine=BattleEngine()
++    private val commands=ConcurrentLinkedQueue<(BattleEngine)->Unit>()
++    private val lock=Any()
++    private var thread: Thread?=null
++    @Volatile private var running=false
++    private var ready=false
++    private var wanted=false
++    private var sound: SoundManager?=null
++    private val store=PurchaseStore(context)
++    private val repository=RunRepository(context)
++    private val paint=Paint(Paint.ANTI_ALIAS_FLAG)
++    private val background=BitmapFactory.decodeResource(resources,R.drawable.background)
++    private val sprites=listOf(R.drawable.normal,R.drawable.fast,R.drawable.tank,R.drawable.enemy_shield,R.drawable.enemy_summoner,R.drawable.enemy_boss).map { BitmapFactory.decodeResource(resources,it) }
++    private val bow=BitmapFactory.decodeResource(resources,resources.getIdentifier(store.getEquippedBow(),"drawable",context.packageName).takeIf { it!=0 } ?: R.drawable.bow)
++    private var shake=0.0
++    private var reportedEnd=false
++    private var lastHud=0L
++    private var lastSave=0.0
++    private var choiceShown=false
++    var onHud: ((RunState)->Unit)?=null
++    var onChoice: ((List<Int>)->Unit)?=null
++    var onFinished: ((RunState)->Unit)?=null
++    init { holder.addCallback(this) }
++    fun configure(state: RunState) { synchronized(lock) { engine=BattleEngine(state) } }
++    fun setSoundManager(manager: SoundManager) { sound=manager }
++    fun command(action: (BattleEngine)->Unit) { commands.add(action) }
++    private fun drain() { while(true) { val c=commands.poll() ?: break; c(engine) } }
++    fun checkpoint() = synchronized(lock) { drain(); repository.save(engine.state) }
++    fun snapshot(): RunState = synchronized(lock) {
++        val b=java.io.ByteArrayOutputStream()
++        java.io.ObjectOutputStream(b).use { it.writeObject(engine.state) }
++        java.io.ObjectInputStream(java.io.ByteArrayInputStream(b.toByteArray())).use { it.readObject() as RunState }
+     }
+-    
+-    private var isTouching = false
+-    private var lastSpawnTime = 0L
+-    var gameStartTime = 0L
+-    private var elapsedSeconds = 0
+-    private var multiShotLevel = 1 
+-    private var shakeIntensity = 0f 
+-
+-    // 기록용 변수들
+-    var arrowsShot = 0
+-    var hitCount = 0
+-    var goldEarned = 0
+-    var goldSpent = 0 // 상점에서 사용 (추가 연동 필요)
+-    var shopPurchaseCount = 0 // 상점 구매 횟수 (추가 연동 필요)
+-    var killCount = 0
+-    var isLowHpSurvivalAchieved = false
+-    private var lowHpStartTime = 0L
+-
+-    // 배틀 아이템 상태
+-    var isPowerArrowActive = false
+-    var powerArrowTimeLeft = 0L
+-    var isSlowStoneActive = false
+-    var slowStoneTimeLeft = 0L
+-    private var lastEffectUpdateTime = 0L
+-
+-    var onStateChanged: (() -> Unit)? = null
+-    var onGameOver: ((Int) -> Unit)? = null
+-    var onUpgrade: ((String) -> Unit)? = null
+-    var score = 0
+-
+-    init {
+-        holder.addCallback(this)
+-        holder.setFormat(PixelFormat.RGBA_8888)
+-        loadResources()
+-    }
+-
+-    private fun loadResources() {
+-        try {
+-            val options = BitmapFactory.Options().apply { inScaled = true }
+-            backgroundBitmap = BitmapFactory.decodeResource(resources, R.drawable.background, options)
+-            
+-            val equippedSkinId = purchaseStore.getEquippedBow()
+-            val skinResId = resources.getIdentifier(equippedSkinId, "drawable", context.packageName)
+-            bowBitmap = BitmapFactory.decodeResource(resources, if (skinResId != 0) skinResId else R.drawable.bow, options)
+-            
+-            normalBitmap = BitmapFactory.decodeResource(resources, R.drawable.normal, options)
+-            fastBitmap = BitmapFactory.decodeResource(resources, R.drawable.fast, options)
+-            tankBitmap = BitmapFactory.decodeResource(resources, R.drawable.tank, options)
+-        } catch (e: Exception) {
+-            Log.e("GameView", "Error loading resources: ${e.message}")
++    fun choose(id: Int) { command {
++        val first=it.state.firstChoiceAt<0
++        if(it.choose(id)) {
++            store.incrementItemStat("v2_card_$id")
++            if(first) store.incrementItemStat("v2_first_choice_reached")
++        }
++        choiceShown=false; repository.save(it.state)
++    } }
++    fun useItem(id: String) { command { e ->
++        val s=e.state
++        if(s.ended || s.choices.isNotEmpty()) return@command
++        val usable=when(id) { "item_potion"->s.hp<10; "item_power"->s.power<=0; else->s.slow<=0 }
++        if(usable && store.useItem(id)) {
++            when(id) {
++                "item_potion"->{ if(s.hp==1) store.incrementItemStat("stat_use_item_potion_at_hp1"); s.hp=min(10,s.hp+3); s.potionUses++ }
++                "item_power"->{ s.power=20.0; s.powerUses++ }
++                else->{ s.slow=10.0; s.slowUses++ }
++            }
++            store.incrementItemStat("stat_use_$id"); repository.save(s)
++        }
++    } }
++    override fun surfaceCreated(holder: SurfaceHolder) { ready=true; synchronized(lock) { render() }; if(wanted) start() }
++    override fun surfaceChanged(holder: SurfaceHolder,format: Int,width: Int,height: Int) {}
++    override fun surfaceDestroyed(holder: SurfaceHolder) { ready=false; stop() }
++    fun resume() { wanted=true; start() }
++    fun pause() { wanted=false; stop(); checkpoint() }
++    @Synchronized private fun start() { if(!ready || running) return; running=true; thread=Thread(this,"BattleLoop").also { it.start() } }
++    private fun stop() { running=false; thread?.join(); thread=null; synchronized(lock) { engine.aiming=false } }
++    override fun run() {
++        var previous=System.nanoTime()
++        while(running) {
++            val now=System.nanoTime(); val dt=(now-previous)/1e9; previous=now
++            synchronized(lock) {
++                drain(); engine.advance(dt)
++                val s=engine.state
++                if(engine.shotEvent) { sound?.playShoot(); engine.shotEvent=false }
++                if(engine.hitEvent) { sound?.playHit(); engine.hitEvent=false }
++                if(engine.killEvent) { sound?.playKill(); engine.killEvent=false }
++                if(engine.hurtEvent) {
++                    shake=.25; engine.hurtEvent=false
++                    if(store.isVibrationEnabled()) {
++                        val v=context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
++                        if(Build.VERSION.SDK_INT>=26) v.vibrate(VibrationEffect.createOneShot(35,80)) else v.vibrate(35)
++                    }
++                }
++                shake=max(0.0,shake-dt)
++                if(now-lastHud>100_000_000) { lastHud=now; val copy=snapshot(); post { onHud?.invoke(copy) } }
++                if(s.choices.isNotEmpty() && !choiceShown) { choiceShown=true; val cards=s.choices.toList(); post { onChoice?.invoke(cards) } }
++                if(s.time-lastSave>=5) { lastSave=s.time; repository.save(s) }
++                if(s.ended && !reportedEnd) { reportedEnd=true; repository.save(s); val copy=snapshot(); post { onFinished?.invoke(copy) } }
++                render()
++            }
++            Thread.sleep(8)
+         }
+     }
+-
+-    fun revive(lastScore: Int, lastStage: Int, lastWave: Int, cumulativeKills: Int, damage: Int, cooldown: Long) {
+-        this.score = lastScore
+-        this.stageManager.sync(lastStage, lastWave)
+-        this.upgradeManager.cumulativeKills = cumulativeKills
+-        this.player.hp = Config.PLAYER_MAX_HP
+-        this.player.currentDamage = damage
+-        
+-        // 부활 시에도 현재 장착된 활 성능 적용
+-        applyBowPerformance()
+-        
+-        val totalElapsedSeconds = (lastStage - 1) * 90 + (lastWave - 1) * 30
+-        this.gameStartTime = System.currentTimeMillis() - (totalElapsedSeconds * 1000L)
+-        this.monsters.clear()
+-        this.arrows.clear()
+-        onStateChanged?.invoke()
+-        resume()
++    private fun render() {
++        if(!holder.surface.isValid) return
++        val c=holder.lockCanvas() ?: return
++        try {
++            c.drawColor(Color.BLACK)
++            val scale=min(width/1920f,height/1080f)
++            c.translate((width-1920*scale)/2,(height-1080*scale)/2); c.scale(scale,scale)
++            if(shake>0 && store.isShakeEnabled()) c.translate((sin(engine.state.time*90)*shake*25).toFloat(),0f)
++            c.drawBitmap(background,null,RectF(0f,0f,1920f,1080f),null)
++            val s=engine.state
++            paint.color=0xAA111826.toInt(); c.drawRect(0f,0f,1920f,115f,paint)
++            paint.color=0xFF63DAD3.toInt(); paint.strokeWidth=3f; c.drawLine(235f,130f,235f,950f,paint)
++            s.enemies.forEach { e ->
++                val size=if(e.kind==5) 360f else if(e.kind==2) 250f else 190f
++                val x=e.x.toFloat(); val y=e.y.toFloat()
++                paint.colorFilter=if(e.flash>0) LightingColorFilter(Color.WHITE,0x888888) else null
++                c.drawBitmap(sprites[e.kind],null,RectF(x-size/2,y-size/2,x+size/2,y+size/2),paint); paint.colorFilter=null
++                paint.color=0xCC111111.toInt(); c.drawRect(x-size*.3f,y-size*.48f,x+size*.3f,y-size*.48f+8,paint)
++                paint.color=if(e.kind==5) 0xFFFF824A.toInt() else 0xFF71DED0.toInt()
++                c.drawRect(x-size*.3f,y-size*.48f,x-size*.3f+size*.6f*(e.hp/e.maxHp).coerceIn(0.0,1.0).toFloat(),y-size*.48f+8,paint)
++                if((e.kind==3 && e.age%5<3) || (e.kind==5 && e.age%12>=8)) {
++                    paint.color=0x8867C8FF.toInt(); paint.style=Paint.Style.STROKE; paint.strokeWidth=6f; c.drawCircle(x,y,size*.44f,paint); paint.style=Paint.Style.FILL
++                }
++                if(e.kind==5 && e.age%12<2) {
++                    paint.color=0x55FF4D32; c.drawRect(240f,y-70,x,y+70,paint)
++                    paint.color=Color.WHITE; paint.textSize=28f; c.drawText(context.getString(R.string.boss_warning),x-160,y-size*.6f,paint)
++                }
++                if(e.chill>0) { paint.color=0x8855CCFF.toInt(); c.drawCircle(x,y+size*.4f,18f,paint) }
++                if(e.burn>0) { paint.color=0xFFFFAB40.toInt(); c.drawCircle(x+35,y+size*.3f,14f,paint) }
++            }
++            s.bolts.forEach { b ->
++                paint.color=if(b.shock) 0xFF6BFFFF.toInt() else if(s.power>0) 0xFFFFB45E.toInt() else Color.WHITE
++                paint.strokeWidth=if(b.shock) 16f else 6f
++                c.drawLine(b.x.toFloat(),b.y.toFloat(),(b.x-cos(b.angle)*75).toFloat(),(b.y-sin(b.angle)*75).toFloat(),paint)
++            }
++            s.sparks.forEach { paint.color=0xFFFFB85A.toInt(); paint.alpha=(it.life/.4*255).toInt().coerceIn(0,255); c.drawCircle(it.x.toFloat(),it.y.toFloat(),6f,paint) }; paint.alpha=255
++            c.save(); c.translate(150f,540f); c.rotate(Math.toDegrees(engine.aim).toFloat()); c.drawBitmap(bow,null,RectF(-240f,-240f,240f,240f),null); c.restore()
++            if(s.combo>1) { paint.color=0xFFFFD573.toInt(); paint.textSize=40f; c.drawText("${s.combo} COMBO",800f,155f,paint) }
++        } finally { holder.unlockCanvasAndPost(c) }
+     }
+-
+-    override fun surfaceCreated(holder: SurfaceHolder) {
+-        isSurfaceCreated = true
+-        if (bowY == 0f) bowY = height / 2f
+-        if (gameStartTime == 0L) gameStartTime = System.currentTimeMillis()
+-        loadResources()
+-        resume()
+-    }
+-
+-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) { bowY = height / 2f }
+-    override fun surfaceDestroyed(holder: SurfaceHolder) { isSurfaceCreated = false; pause() }
+-
+-    override fun run() {
+-        while (isPlaying) {
+-            if (!isSurfaceCreated) { try { Thread.sleep(100) } catch (e: Exception) {}; continue }
+-            val startTime = System.currentTimeMillis()
+-            try {
+-                update()
+-                draw()
+-            } catch (e: Exception) {
+-                Log.e("GameView", "Error in game loop", e)
+-            }
+-            val timeTaken = System.currentTimeMillis() - startTime
+-            val sleepTime = 16L - timeTaken
+-            if (sleepTime > 0) { try { Thread.sleep(sleepTime) } catch (e: Exception) {} }
+-        }
+-    }
+-
+-    private fun update() {
+-        if (width <= 0 || height <= 0) return
+-        elapsedSeconds = ((System.currentTimeMillis() - gameStartTime) / 1000).toInt()
+-
+-        updateEffects()
+-
+-        // 위기 극복 업적 체크 (HP 30% 이하 30초 생존)
+-        if (player.hp > 0 && player.hp <= Config.PLAYER_MAX_HP * 0.3f) {
+-            if (lowHpStartTime == 0L) lowHpStartTime = System.currentTimeMillis()
+-            else if (System.currentTimeMillis() - lowHpStartTime >= 30000L) {
+-                isLowHpSurvivalAchieved = true
+-            }
+-        } else {
+-            lowHpStartTime = 0L
+-        }
+-
+-        val newWave = (elapsedSeconds / 30) % 3 + 1
+-        val newStage = (elapsedSeconds / 90) + 1
+-        
+-        if (stageManager.currentWave != newWave || stageManager.currentStage != newStage) {
+-            stageManager.currentWave = newWave
+-            stageManager.currentStage = newStage
+-            stageManager.monstersSpawned = 0
+-            onStateChanged?.invoke()
+-        }
+-
+-        updatePlayerStats() 
+-        spawnMonsterSystem() 
+-
+-        val arrowsToRemove = mutableListOf<Arrow>()
+-        val monstersToRemove = mutableListOf<Monster>()
+-
+-        // 화살 업데이트
+-        arrows.forEach { arrow ->
+-            arrow.update()
+-            // 화살이 화면의 오른쪽 끝(width)을 넘어가면 즉시 제거 대상에 추가
+-            if (arrow.x > width || arrow.x < -200 || arrow.y < -200 || arrow.y > height + 200) {
+-                arrowsToRemove.add(arrow)
+-            }
+-        }
+-
+-        // 몬스터 업데이트 및 충돌 검사
+-        monsters.forEach { monster ->
+-            if (isSlowStoneActive) monster.updateSlowed()
+-            else monster.update()
+-            
+-            if (monster.x < bowX) {
+-                player.hp -= monster.type.damage
+-                shakeIntensity = 20f 
+-                vibrate(50) 
+-                monstersToRemove.add(monster)
+-                onStateChanged?.invoke()
+-                if (player.hp <= 0 && isPlaying) {
+-                    player.hp = 0
+-                    isPlaying = false
+-                    onGameOver?.invoke(score) 
+-                }
+-            } else {
+-                for (arrow in arrows) {
+-                    if (arrowsToRemove.contains(arrow)) continue
+-                    if (RectF.intersects(monster.getBounds(), arrow.getBounds())) {
+-                        monster.takeDamage(arrow.damage)
+-                        arrowsToRemove.add(arrow)
+-                        hitCount++ // 명중 횟수 증가
+-                        if (monster.isDead()) {
+-                            monstersToRemove.add(monster)
+-                            score += monster.scoreValue
+-                            killCount++ // 처치 수 증가
+-                            // 골드 획득: 기본 점수의 10%를 골드로 환산 (최소 1골드)
+-                            val earned = (monster.scoreValue / 10).coerceAtLeast(1)
+-                            goldEarned += earned
+-                            purchaseStore.addGold(earned)
+-                            
+-                            onStateChanged?.invoke()
+-                            break 
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        if (arrowsToRemove.isNotEmpty()) arrows.removeAll(arrowsToRemove)
+-        if (monstersToRemove.isNotEmpty()) monsters.removeAll(monstersToRemove)
+-
+-        if (isTouching && player.canFire()) {
+-            fireMultiShot()
+-            player.resetFireTime()
+-            soundManager?.playShoot()
+-        }
+-    }
+-
+-    private fun vibrate(ms: Long) {
+-        if (!purchaseStore.isVibrationEnabled()) return
+-        try {
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+-                vibrator.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+-            } else {
+-                @Suppress("DEPRECATION")
+-                vibrator.vibrate(ms)
+-            }
+-        } catch (e: Exception) {}
+-    }
+-
+-    /**
+-     * 장착된 활에 따라 연사 속도를 적용하고, 게임 진행도(점수)에 따라 추가로 가속합니다.
+-     */
+-    private fun applyBowPerformance() {
+-        val equippedBow = purchaseStore.getEquippedBow()
+-        val baseCooldown = Config.BASE_FIRE_COOLDOWN // 500ms
+-        
+-        val bowMultiplier = when (equippedBow) {
+-            "high_bow" -> 0.7f // 아스트라 기어 보우: 30% 더 빠름
+-            "bow" -> 1.0f // 기본 활
+-            else -> 0.8f // 기타 유료 활: 20% 더 빠름
+-        }
+-
+-        // 점수에 따른 점진적 연사 속도 증가 (최대 2배 속도까지, 즉 쿨타임 절반)
+-        // 10000점 기준 최대 속도 도달 예시
+-        val scoreFactor = (score / 10000f).coerceAtMost(0.5f)
+-        val finalCooldown = (baseCooldown * bowMultiplier * (1.0f - scoreFactor)).toLong()
+-        
+-        // 최소 쿨타임을 베이스의 절반(250ms)으로 제한
+-        player.fireCooldown = finalCooldown.coerceAtLeast(baseCooldown / 2)
+-    }
+-
+-    private fun updatePlayerStats() {
+-        val oldLevel = multiShotLevel
+-        
+-        // 멀티샷 해금: 점수 1000점 단위 (1000점: 2단계, 2000점: 3단계)
+-        multiShotLevel = when {
+-            score < 1000 -> 1
+-            score < 2000 -> 2
+-            else -> 3
+-        }
+-
+-        // 장착된 활에 따른 연사 속도 고정 적용
+-        applyBowPerformance()
+-
+-        // 데미지는 시간 경과에 따라 강화
+-        when {
+-            elapsedSeconds < Config.TIME_STEP_1 -> player.currentDamage = 1
+-            elapsedSeconds < Config.TIME_STEP_2 -> player.currentDamage = 2
+-            elapsedSeconds < Config.TIME_STEP_3 -> player.currentDamage = 3
+-            elapsedSeconds < Config.TIME_STEP_4 -> player.currentDamage = 4
+-            elapsedSeconds < Config.TIME_STEP_5 -> player.currentDamage = 6
+-            else -> player.currentDamage = 7 + (elapsedSeconds - 120) / 30
+-        }
+-        
+-        if (oldLevel != multiShotLevel) {
+-            onUpgrade?.invoke(context.getString(R.string.multishot_unlocked, multiShotLevel))
+-        }
+-    }
+-
+-    private fun spawnMonsterSystem() {
+-        val currentTime = System.currentTimeMillis()
+-        
+-        // 화면에 있는 몬스터 수 제한 (최대 15마리)
+-        if (monsters.size >= 15) return
+-
+-        // 스폰 간격 설정: 1000점 이후에도 무조건 1초(1000ms) 내외로 등장하도록 고정
+-        // 초반에는 조금 더 길게, 1000점 이후에는 0.6~0.9초 사이로 유지
+-        val spawnInterval = when {
+-            score < 500 -> 1800L
+-            score < 1000 -> 1200L
+-            else -> 800L // 1000점 이후에는 약 0.8초마다 한 마리씩 꾸준히 등장
+-        }
+-
+-        if (currentTime - lastSpawnTime >= spawnInterval) {
+-            val type = getMonsterTypeByTime()
+-            
+-            // 난이도 조절 로직
+-            var hpMult = 1f + (elapsedSeconds / 60f) * 0.5f
+-            if (score >= 1000) {
+-                hpMult += ((score - 1000) / 200f)
+-            }
+-
+-            var spdMult = 1f + (elapsedSeconds / 80f) * 0.1f
+-            if (score >= 1000) {
+-                spdMult += (score - 1000) / 5000f
+-            }
+-            spdMult = spdMult.coerceAtMost(3.0f)
+-
+-            val minY = 150f
+-            val maxY = (height - 300f).coerceAtLeast(minY + 1f)
+-            val spawnY = (minY.toInt()..maxY.toInt()).random().toFloat()
+-            
+-            monsters.add(Monster(width.toFloat(), spawnY,
+-                (type.baseHp * hpMult).toInt(), type.speed * spdMult, type, type.score))
+-            
+-            stageManager.monstersSpawned++
+-            lastSpawnTime = currentTime
+-        }
+-    }
+-
+-    private fun getMonsterTypeByTime(): Config.MonsterType {
+-        val rand = (1..100).random()
+-        return when {
+-            elapsedSeconds < Config.TIME_STEP_1 -> if (rand <= 85) Config.MonsterType.NORMAL else Config.MonsterType.FAST
+-            elapsedSeconds < Config.TIME_STEP_3 -> if (rand <= 65) Config.MonsterType.NORMAL else if (rand <= 95) Config.MonsterType.FAST else Config.MonsterType.TANK
+-            else -> if (rand <= 40) Config.MonsterType.NORMAL else if (rand <= 75) Config.MonsterType.FAST else Config.MonsterType.TANK
+-        }
+-    }
+-
+-    private fun fireMultiShot() {
+-        val rad = Math.toRadians(bowAngle.toDouble())
+-        val startX = bowX + (BOW_SIZE / 3f * cos(rad)).toFloat()
+-        val startY = bowY + (BOW_SIZE / 3f * sin(rad)).toFloat()
+-        
+-        val offsetX = (45f * sin(rad)).toFloat()
+-        val offsetY = (45f * cos(rad)).toFloat()
+-
+-        val damage = if (isPowerArrowActive) (player.currentDamage * 1.5f).toInt() else player.currentDamage
+-
+-        when (multiShotLevel) {
+-            1 -> {
+-                arrows.add(Arrow(startX, startY, bowAngle, player.arrowSpeed, damage))
+-                arrowsShot++
+-            }
+-            2 -> {
+-                arrows.add(Arrow(startX + offsetX/2, startY - offsetY/2, bowAngle, player.arrowSpeed, damage))
+-                arrows.add(Arrow(startX - offsetX/2, startY + offsetY/2, bowAngle, player.arrowSpeed, damage))
+-                arrowsShot += 2
+-            }
+-            3 -> {
+-                arrows.add(Arrow(startX + offsetX, startY - offsetY, bowAngle, player.arrowSpeed, damage))
+-                arrows.add(Arrow(startX, startY, bowAngle, player.arrowSpeed, damage))
+-                arrows.add(Arrow(startX - offsetX, startY + offsetY, bowAngle, player.arrowSpeed, damage))
+-                arrowsShot += 3
+-            }
+-        }
+-    }
+-
+-    private fun updateEffects() {
+-        val now = System.currentTimeMillis()
+-        if (lastEffectUpdateTime == 0L) lastEffectUpdateTime = now
+-        val delta = now - lastEffectUpdateTime
+-        lastEffectUpdateTime = now
+-
+-        if (isPowerArrowActive) {
+-            powerArrowTimeLeft -= delta
+-            if (powerArrowTimeLeft <= 0) {
+-                isPowerArrowActive = false
+-                powerArrowTimeLeft = 0
+-            }
+-        }
+-
+-        if (isSlowStoneActive) {
+-            slowStoneTimeLeft -= delta
+-            if (slowStoneTimeLeft <= 0) {
+-                isSlowStoneActive = false
+-                slowStoneTimeLeft = 0
+-            }
+-        }
+-    }
+-
+-    private fun draw() {
+-        if (!holder.surface.isValid) return
+-        val canvas = try { holder.lockCanvas() } catch (e: Exception) { null } ?: return
+-        try {
+-            if (shakeIntensity > 0) {
+-                val sx = (Math.random() * shakeIntensity * 2 - shakeIntensity).toFloat()
+-                val sy = (Math.random() * shakeIntensity * 2 - shakeIntensity).toFloat()
+-                canvas.translate(sx, sy)
+-                shakeIntensity *= 0.9f
+-                if (shakeIntensity < 0.5f) shakeIntensity = 0f
+-            }
+-            canvas.drawColor(Color.BLACK)
+-            if (backgroundBitmap != null) canvas.drawBitmap(backgroundBitmap!!, null, Rect(0, 0, width, height), null)
+-            monsters.forEach { monster ->
+-                val bitmap = when(monster.type) {
+-                    Config.MonsterType.NORMAL -> normalBitmap
+-                    Config.MonsterType.FAST -> fastBitmap
+-                    Config.MonsterType.TANK -> tankBitmap
+-                }
+-                
+-                // 탱크 몬스터는 크기 1.4배 적용 (기존 2배에서 30% 축소: 2.0 * 0.7 = 1.4)
+-                val isTank = monster.type == Config.MonsterType.TANK
+-                val sizeMultiplier = if (isTank) 1.4f else 1.0f
+-                val renderSize = Config.MONSTER_RENDER_SIZE * sizeMultiplier
+-
+-                if (bitmap != null) canvas.drawBitmap(bitmap, null, RectF(monster.x, monster.y, monster.x + renderSize, monster.y + renderSize), null)
+-                else {
+-                    val p = Paint().apply { color = monster.type.color }
+-                    canvas.drawRect(monster.x, monster.y, monster.x + renderSize, monster.y + renderSize, p)
+-                }
+-            }
+-            arrows.forEach { arrow ->
+-                canvas.save()
+-                canvas.rotate(arrow.angle, arrow.x, arrow.y)
+-                if (isPowerArrowActive) arrowPaint.color = Color.RED else arrowPaint.color = Color.WHITE
+-                canvas.drawLine(arrow.x, arrow.y, arrow.x + 100f, arrow.y, arrowPaint)
+-                canvas.restore()
+-            }
+-            
+-            // 시간 지연 효과 (푸른 파동)
+-            if (isSlowStoneActive) {
+-                val p = Paint().apply {
+-                    color = Color.BLUE
+-                    alpha = 30
+-                    style = Paint.Style.FILL
+-                }
+-                canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), p)
+-            }
+-
+-            canvas.save()
+-            canvas.translate(bowX, bowY); canvas.rotate(bowAngle)
+-            if (isPowerArrowActive) {
+-                val glowPaint = Paint().apply {
+-                    color = Color.RED
+-                    maskFilter = BlurMaskFilter(20f, BlurMaskFilter.Blur.NORMAL)
+-                }
+-                canvas.drawCircle(0f, 0f, BOW_SIZE/2, glowPaint)
+-            }
+-            if (bowBitmap != null) canvas.drawBitmap(bowBitmap!!, null, RectF(-BOW_SIZE/2, -BOW_SIZE/2, BOW_SIZE/2, BOW_SIZE/2), null)
+-            canvas.restore()
+-        } finally { try { holder.unlockCanvasAndPost(canvas) } catch (e: Exception) {} }
+-    }
+-
+-    fun setSoundManager(sm: SoundManager) { this.soundManager = sm }
+     override fun onTouchEvent(event: MotionEvent): Boolean {
+-        val dx = event.x - bowX; val dy = event.y - bowY
+-        bowAngle = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
+-        when (event.action) {
+-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> isTouching = true
+-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> isTouching = false
+-        }
+-        performClick(); return true
++        val scale=min(width/1920f,height/1080f)
++        val x=(event.x-(width-1920*scale)/2)/scale; val y=(event.y-(height-1080*scale)/2)/scale
++        val pressed=event.actionMasked==MotionEvent.ACTION_DOWN || event.actionMasked==MotionEvent.ACTION_MOVE
++        command { it.aim=atan2((y-540).toDouble(),(x-250).toDouble()).coerceIn(-1.2,1.2); it.aiming=pressed }
++        if(event.actionMasked==MotionEvent.ACTION_UP) performClick()
++        return true
+     }
+     override fun performClick(): Boolean { super.performClick(); return true }
+-    fun resume() { if (isPlaying || !isSurfaceCreated) return; isPlaying = true; gameThread = Thread(this); gameThread?.start() }
+-    fun pause() { isPlaying = false; try { gameThread?.join(500); gameThread = null } catch (e: Exception) {} }
+ }
+--- before/app/src/main/java/com/example/bowdefense/MainActivity.kt
++++ after/app/src/main/java/com/example/bowdefense/MainActivity.kt
+@@ -27,7 +27,7 @@
+         setContentView(R.layout.activity_main)
+ 
+         // Mobile Ads SDK 초기화
+-        MobileAds.initialize(this) {}
++        if (BuildConfig.ADS_ENABLED) MobileAds.initialize(this) {}
+ 
+         saveManager = SaveManager(this)
+         lifeManager = LifeManager(this)
+@@ -37,6 +37,9 @@
+         // 업적 초기화
+         lifecycleScope.launch {
+             dataManager.initAchievements()
++            RunRepository(this@MainActivity).load()?.takeIf { it.ended }?.let { RunFinalizer.finish(this@MainActivity,it) }
++            dataManager.refreshShopAchievements()
++            updateUI()
+         }
+ 
+         highScoreText = findViewById(R.id.highScoreTextView)
+@@ -52,13 +55,16 @@
+         // 광고 로드
+         adView = findViewById(R.id.adViewMain)
+         val adRequest = AdRequest.Builder().build()
+-        adView.loadAd(adRequest)
++        if (BuildConfig.ADS_ENABLED) adView.loadAd(adRequest) else adView.visibility=android.view.View.GONE
+ 
+         // 게임 시작
+         startButton.setOnClickListener {
+-            GameSessionManager.reset()
+-            val intent = Intent(this, GameActivity::class.java)
+-            startActivity(intent)
++            val saved=RunRepository(this).load()
++            if(saved!=null && !saved.ended) {
++                AlertDialog.Builder(this).setTitle(R.string.resume).setMessage(R.string.resume_checkpoint)
++                    .setPositiveButton(R.string.resume) { _,_ -> startActivity(Intent(this,GameActivity::class.java).putExtra("RESUME_RUN",true)) }
++                    .setNegativeButton(R.string.new_expedition) { _,_ -> chooseMode() }.show()
++            } else chooseMode()
+         }
+ 
+         // 상점 이동
+@@ -81,6 +87,27 @@
+         settingsButton.setOnClickListener {
+             showSettingsDialog()
+         }
++    }
++
++    private fun chooseMode() {
++        val modes=resources.getStringArray(R.array.archetypes)
++        val unlocked=if(purchaseStore.chapterCleared()) 3 else if(purchaseStore.getHighScore()>=500) 2 else 1
++        AlertDialog.Builder(this).setTitle(R.string.choose_weapon).setItems(modes.take(unlocked).toTypedArray()) { _,kind ->
++            val begin: (Boolean)->Unit = { endless ->
++                lifecycleScope.launch {
++                    val repository=RunRepository(this@MainActivity)
++                    repository.load()?.takeIf { !it.ended }?.let { old ->
++                        old.ended=true; old.abandoned=true; repository.save(old)
++                        RunFinalizer.finish(this@MainActivity,old)
++                    }
++                    repository.clear(); GameSessionManager.reset()
++                    startActivity(Intent(this@MainActivity,GameActivity::class.java).putExtra("ARCHETYPE",kind).putExtra("ENDLESS",endless))
++                }
++            }
++            if(purchaseStore.chapterCleared()) AlertDialog.Builder(this).setTitle(R.string.choose_mode)
++                .setItems(resources.getStringArray(R.array.battle_modes)) { _,mode -> begin(mode==1) }.show()
++            else begin(false)
++        }.show()
+     }
+ 
+     private fun showSettingsDialog() {
+@@ -127,7 +154,8 @@
+ 
+     private fun updateUI() {
+         highScoreText.text = getString(R.string.high_score, saveManager.getHighScore())
+-        lifeCountText.text = getString(R.string.life_count, lifeManager.getLifeCount())
++        lifeCountText.text = getString(R.string.life_count, lifeManager.getLifeCount()) + "\n" +
++            getString(R.string.next_goals, purchaseStore.getHighScore().coerceAtMost(500), if(purchaseStore.chapterCleared()) 1 else 0, purchaseStore.supplyPurchases().coerceAtMost(1))
+     }
+ 
+     override fun onResume() {
+@@ -146,3 +174,4 @@
+         super.onDestroy()
+     }
+ }
++
+--- before/app/src/main/java/com/example/bowdefense/PurchaseStore.kt
++++ after/app/src/main/java/com/example/bowdefense/PurchaseStore.kt
+@@ -6,11 +6,11 @@
+ /**
+  * 모든 영구 데이터(구매 내역, 장착 상태, 점수, 생명)를 관리하는 통합 클래스입니다.
+  */
+-class PurchaseStore(context: Context) {
+-    private val prefs: SharedPreferences = context.getSharedPreferences("BowDefensePrefs", Context.MODE_PRIVATE)
++class PurchaseStore(context: Context, preferenceName: String = "BowDefensePrefs") {
++    private val prefs: SharedPreferences = context.getSharedPreferences(preferenceName, Context.MODE_PRIVATE)
+ 
+     // 최고 점수 관리
+-    fun saveHighScore(score: Int) {
++    fun saveHighScore(score: Int) = synchronized(transactionLock) {
+         val currentHigh = getHighScore()
+         if (score > currentHigh) {
+             prefs.edit().putInt("high_score", score).apply()
+@@ -20,27 +20,27 @@
+ 
+     // 골드 관리
+     fun getGold(): Int = prefs.getInt("total_gold", 0)
+-    fun addGold(amount: Int) {
++    fun addGold(amount: Int) = synchronized(transactionLock) {
+         prefs.edit().putInt("total_gold", getGold() + amount).apply()
+     }
+ 
+     // 아이템 수량 관리
+     fun getItemCount(itemId: String): Int = prefs.getInt("item_$itemId", 0)
+-    fun addItem(itemId: String, count: Int) {
++    fun addItem(itemId: String, count: Int) = synchronized(transactionLock) {
+         val current = getItemCount(itemId)
+         prefs.edit().putInt("item_$itemId", (current + count).coerceIn(0, 10)).apply()
+     }
+-    fun useItem(itemId: String): Boolean {
++    fun useItem(itemId: String): Boolean = synchronized(transactionLock) {
+         val current = getItemCount(itemId)
+         if (current > 0) {
+             prefs.edit().putInt("item_$itemId", current - 1).apply()
+-            return true
++            return@synchronized true
+         }
+-        return false
++        false
+     }
+ 
+     // 아이템 통계
+-    fun incrementItemStat(statKey: String) {
++    fun incrementItemStat(statKey: String) = synchronized(transactionLock) {
+         val current = prefs.getInt(statKey, 0)
+         prefs.edit().putInt(statKey, current + 1).apply()
+     }
+@@ -48,7 +48,7 @@
+ 
+     // 생명(이어하기 아이템) 관리
+     fun getLifeCount(): Int = prefs.getInt("life_count", 0)
+-    fun addLives(count: Int) {
++    fun addLives(count: Int) = synchronized(transactionLock) {
+         prefs.edit().putInt("life_count", getLifeCount() + count).apply()
+     }
+ 
+@@ -57,7 +57,7 @@
+         if (productId == "bow") return true // 기본 활은 항상 소유
+         return prefs.getBoolean("owned_$productId", false)
+     }
+-    fun setOwned(productId: String, owned: Boolean) {
++    fun setOwned(productId: String, owned: Boolean) = synchronized(transactionLock) {
+         prefs.edit().putBoolean("owned_$productId", owned).apply()
+     }
+ 
+@@ -67,17 +67,51 @@
+     }
+ 
+     // 활 장착 상태 저장
+-    fun setEquippedBow(productId: String) {
++    fun setEquippedBow(productId: String) = synchronized(transactionLock) {
+         prefs.edit().putString("equipped_bow", productId).apply()
+     }
+ 
+     // 설정 관리
+     fun isBgmEnabled(): Boolean = prefs.getBoolean("bgm_enabled", true)
+-    fun setBgmEnabled(enabled: Boolean) {
++    fun setBgmEnabled(enabled: Boolean) = synchronized(transactionLock) {
+         prefs.edit().putBoolean("bgm_enabled", enabled).apply()
+     }
+     fun isVibrationEnabled(): Boolean = prefs.getBoolean("vibration_enabled", true)
+-    fun setVibrationEnabled(enabled: Boolean) {
++    fun setVibrationEnabled(enabled: Boolean) = synchronized(transactionLock) {
+         prefs.edit().putBoolean("vibration_enabled", enabled).apply()
+     }
++
++    companion object { private val transactionLock = Any() }
++    fun isShakeEnabled() = prefs.getBoolean("screen_shake", true)
++    fun setShakeEnabled(enabled: Boolean) { prefs.edit().putBoolean("screen_shake",enabled).apply() }
++    fun chapterCleared() = prefs.getBoolean("chapter_clear_v2",false)
++    fun setChapterCleared() { prefs.edit().putBoolean("chapter_clear_v2",true).commit() }
++    fun awardOnce(key: String, amount: Int) = synchronized(transactionLock) {
++        if (!prefs.getBoolean("awarded_$key",false)) prefs.edit().putInt("total_gold",getGold()+amount.coerceAtLeast(0)).putBoolean("awarded_$key",true).commit()
++    }
++    fun commitRunGold(session: String, gold: Int) = synchronized(transactionLock) {
++        val paid=prefs.getInt("run_paid_$session",0)
++        if(gold>paid) prefs.edit().putInt("total_gold",getGold()+gold-paid).putInt("run_paid_$session",gold).commit()
++    }
++    fun buySupply(id: String, price: Int): Boolean = synchronized(transactionLock) {
++        if(getGold()<price || getItemCount(id)>=10) return@synchronized false
++        prefs.edit().putInt("total_gold",getGold()-price).putInt("item_$id",getItemCount(id)+1)
++            .putInt("supply_purchases",prefs.getInt("supply_purchases",0)+1)
++            .putInt("supply_spent",prefs.getInt("supply_spent",0)+price).commit()
++    }
++    fun supplyPurchases() = prefs.getInt("supply_purchases",0)
++    fun supplySpent() = prefs.getInt("supply_spent",0)
++    fun preparationSpent() = supplySpent()-prefs.getInt("prepared_spent",0)
++    fun preparationPurchases() = supplyPurchases()-prefs.getInt("prepared_purchases",0)
++    fun markPreparationUsed() { prefs.edit().putInt("prepared_spent",supplySpent()).putInt("prepared_purchases",supplyPurchases()).commit() }
++    fun metricOnce(event: String, key: String) = synchronized(transactionLock) {
++        if(!prefs.getBoolean("metric_$event",false)) prefs.edit().putBoolean("metric_$event",true).putInt(key,getItemStat(key)+1).commit()
++    }
++
++    fun canContinue(session: String): Boolean = getLifeCount()>0 || prefs.getBoolean("continue_$session",false)
++    fun reserveContinue(session: String): Boolean = synchronized(transactionLock) {
++        if(prefs.getBoolean("continue_$session",false)) return@synchronized true
++        if(getLifeCount()<=0) return@synchronized false
++        prefs.edit().putInt("life_count",getLifeCount()-1).putBoolean("continue_$session",true).commit()
++    }
+ }
+--- before/app/src/main/java/com/example/bowdefense/ResultActivity.kt
++++ after/app/src/main/java/com/example/bowdefense/ResultActivity.kt
+@@ -18,6 +18,12 @@
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         setContentView(R.layout.activity_result)
++        if (intent.getBooleanExtra("CLEARED", false)) {
++            findViewById<TextView>(R.id.resultTitle).apply {
++                setText(R.string.chapter_clear)
++                setTextColor(android.graphics.Color.rgb(80, 220, 180))
++            }
++        }
+ 
+         lifeManager = LifeManager(this)
+         dataManager = DataManager(this)
+@@ -48,7 +54,18 @@
+ 
+         // AI 분석 한줄
+         val aiAnalysisShort = findViewById<TextView>(R.id.aiAnalysisShort)
+-        aiAnalysisShort.text = generateAiAnalysis(score, accuracy, survivalTime)
++        val levels=intent.getIntArrayExtra("BUILD") ?: IntArray(12)
++        val names=resources.getStringArray(R.array.card_names)
++        val build=levels.indices.filter { levels[it]>0 }.joinToString(" · ") { "${names[it]} ${levels[it]}" }
++        val cause=intent.getIntExtra("DEATH_KIND",-1)
++        val enemies=resources.getStringArray(R.array.enemy_names)
++        aiAnalysisShort.text=getString(R.string.battle_feedback)+"\n"+
++            (if(intent.getBooleanExtra("CLEARED",false)) getString(R.string.chapter_clear) else if(cause in enemies.indices) getString(R.string.defeated_by,enemies[cause]) else "")+
++            "\n"+build+"\n"+getString(R.string.best_difference,score-intent.getIntExtra("PREVIOUS_BEST",0))+"\n"+
++            (if(accuracy<40) getString(R.string.ai_analysis_4) else if(intent.getIntExtra("SHOCK_USES",0)==0) getString(R.string.try_shock) else getString(R.string.ai_analysis_default))
++
++        val progress=PurchaseStore(this)
++        aiAnalysisShort.append("\n"+getString(R.string.next_goals,progress.getHighScore().coerceAtMost(500),if(progress.chapterCleared()) 1 else 0,progress.supplyPurchases().coerceAtMost(1)))
+ 
+         // 새 업적 표시
+         if (newAchievementIds.isNotEmpty()) {
+@@ -76,7 +93,7 @@
+         val viewRecordButton = findViewById<Button>(R.id.viewRecordButton)
+ 
+         val lives = lifeManager.getLifeCount()
+-        if (lives > 0 && !GameSessionManager.hasContinuedThisGame) {
++        if (RunRepository(this).load()?.let { it.ended && !it.cleared && !it.continued && PurchaseStore(this).canContinue(it.sessionId) } == true) {
+             continueButton.visibility = View.VISIBLE
+             continueButton.text = getString(R.string.continue_with_lives, lives)
+         } else {
+@@ -84,7 +101,8 @@
+         }
+ 
+         continueButton.setOnClickListener {
+-            if (lifeManager.useLife()) {
++            continueButton.isEnabled=false
++            if (RunRepository(this).load()?.let { PurchaseStore(this).reserveContinue(it.sessionId) } == true) {
+                 GameSessionManager.hasContinuedThisGame = true
+                 val intent = Intent(this, GameActivity::class.java).apply {
+                     putExtra("CONTINUE_GAME", true)
+@@ -104,6 +122,8 @@
+         }
+ 
+         restartButton.setOnClickListener {
++            PurchaseStore(this).incrementItemStat("v2_retries")
++            RunRepository(this).clear()
+             GameSessionManager.reset()
+             startActivity(Intent(this, GameActivity::class.java))
+             finish()
+--- before/app/src/main/java/com/example/bowdefense/RunFinalizer.kt
++++ after/app/src/main/java/com/example/bowdefense/RunFinalizer.kt
+@@ -0,0 +1,25 @@
++package com.example.bowdefense
++import android.content.Context
++
++/** Replayed at startup after a crash; Room session updates and wallet credit are idempotent. */
++object RunFinalizer {
++    fun record(s: RunState) = GameRecord(playDate=s.createdAt,survivalTimeSeconds=s.time.toInt(),score=s.score,killCount=s.kills,
++        arrowsShot=s.shots,hitCount=s.hits,accuracy=if(s.shots>0) s.hits*100f/s.shots else 0f,
++        goldEarned=s.gold,goldSpent=s.goldSpent,shopPurchaseCount=s.purchases,bowChangeCount=0,
++        maxStage=(s.wave-1)/3+1,maxWave=(s.wave-1)%3+1,resultType=if(s.cleared) "CLEAR" else if(s.abandoned) "EXIT" else "DEAD",
++        isLowHpSurvivalAchieved=s.lowHpAchieved,sessionId=s.sessionId)
++    suspend fun finish(context: Context,s: RunState): List<Achievement> {
++        val manager=DataManager(context)
++        manager.initAchievements()
++        val achievements=manager.saveGameRecord(record(s))
++        PurchaseStore(context).apply {
++            commitRunGold(s.sessionId,s.gold); saveHighScore(s.score)
++            if(s.cleared) setChapterCleared()
++            metricOnce("finish_${s.sessionId}","v2_finished")
++            if(s.time<30 && !s.abandoned) metricOnce("early_${s.sessionId}","v2_death_before_30s")
++            if(s.wave>=8) metricOnce("boss_${s.sessionId}","v2_boss_reached")
++            if(s.cleared) metricOnce("clear_${s.sessionId}","v2_clear_archetype_${s.archetype}")
++        }
++        return achievements
++    }
++}
+--- before/app/src/main/java/com/example/bowdefense/RunRepository.kt
++++ after/app/src/main/java/com/example/bowdefense/RunRepository.kt
+@@ -0,0 +1,19 @@
++package com.example.bowdefense
++import android.content.Context
++import android.util.AtomicFile
++import java.io.*
++class RunRepository(context: Context) {
++    private val file = AtomicFile(File(context.filesDir,"run-v2.bin"))
++    fun save(state: RunState) = synchronized(lock) {
++        val out=file.startWrite()
++        try {
++            val bytes=ByteArrayOutputStream().also { b -> ObjectOutputStream(b).use { it.writeInt(2); it.writeObject(state) } }.toByteArray()
++            out.write(bytes); file.finishWrite(out)
++        } catch(e: Exception) { file.failWrite(out); throw e }
++    }
++    fun load(): RunState? = synchronized(lock) {
++        try { ObjectInputStream(file.openRead()).use { if(it.readInt()==2) it.readObject() as RunState else null } } catch(_: Exception) { null }
++    }
++    fun clear() = synchronized(lock) { file.delete() }
++    companion object { private val lock=Any() }
++}
+--- before/app/src/main/java/com/example/bowdefense/ShopActivity.kt
++++ after/app/src/main/java/com/example/bowdefense/ShopActivity.kt
+@@ -86,9 +86,9 @@
+ 
+         // 3. 배틀 아이템 섹션
+         shopItems.add(ShopBowItem("div_battle", getString(R.string.battle_item_section), itemType = ShopBowItem.TYPE_DIVIDER))
+-        shopItems.add(ShopBowItem("item_potion", getString(R.string.item_potion_name), effectText = getString(R.string.item_potion_desc), itemType = ShopBowItem.TYPE_BATTLE_ITEM, goldPrice = 500))
+-        shopItems.add(ShopBowItem("item_power", getString(R.string.item_power_name), effectText = getString(R.string.item_power_desc), itemType = ShopBowItem.TYPE_BATTLE_ITEM, goldPrice = 800))
+-        shopItems.add(ShopBowItem("item_slow", getString(R.string.item_slow_name), effectText = getString(R.string.item_slow_desc), itemType = ShopBowItem.TYPE_BATTLE_ITEM, goldPrice = 1200))
++        shopItems.add(ShopBowItem("item_potion", getString(R.string.item_potion_name), effectText = getString(R.string.item_potion_desc), itemType = ShopBowItem.TYPE_BATTLE_ITEM, goldPrice = 60))
++        shopItems.add(ShopBowItem("item_power", getString(R.string.item_power_name), effectText = getString(R.string.item_power_desc), itemType = ShopBowItem.TYPE_BATTLE_ITEM, goldPrice = 90))
++        shopItems.add(ShopBowItem("item_slow", getString(R.string.item_slow_name), effectText = getString(R.string.item_slow_desc), itemType = ShopBowItem.TYPE_BATTLE_ITEM, goldPrice = 100))
+     }
+ 
+     private fun handleItemAction(item: ShopBowItem) {
+@@ -98,8 +98,8 @@
+             val currentGold = purchaseStore.getGold()
+             if (currentGold >= item.goldPrice) {
+                 if (purchaseStore.getItemCount(item.productId) < 10) {
+-                    purchaseStore.addGold(-item.goldPrice)
+-                    purchaseStore.addItem(item.productId, 1)
++                    if (!purchaseStore.buySupply(item.productId,item.goldPrice)) return
++                    lifecycleScope.launch { dataManager.refreshShopAchievements() }
+                     purchaseStore.incrementItemStat("stat_buy_${item.productId}")
+                     updateUI()
+                     Toast.makeText(this, getString(R.string.purchase_complete, item.displayName), Toast.LENGTH_SHORT).show()
+@@ -155,5 +155,6 @@
+         super.onResume()
+         billingManager.restorePurchases()
+         updateUI()
++        lifecycleScope.launch { dataManager.refreshShopAchievements() }
+     }
+ }
+--- before/app/src/main/java/com/example/bowdefense/SoundManager.kt
++++ after/app/src/main/java/com/example/bowdefense/SoundManager.kt
+@@ -12,6 +12,8 @@
+ class SoundManager(val context: Context) {
+     private var soundPool: SoundPool
+     private var shootSoundId: Int = 0
++    private var hitSoundId: Int = 0
++    private var killSoundId: Int = 0
+     private var bgmPlayer: MediaPlayer? = null
+     private val purchaseStore = PurchaseStore(context)
+ 
+@@ -30,6 +32,8 @@
+         try {
+             // res/raw/shootingarrow.mp3 로드
+             shootSoundId = soundPool.load(context, R.raw.shootingarrow, 1)
++            hitSoundId = soundPool.load(context,R.raw.impact,1)
++            killSoundId = soundPool.load(context,R.raw.defeat,1)
+         } catch (e: Exception) {
+             Log.e("SoundManager", "Error loading sound effect", e)
+         }
+@@ -50,6 +54,8 @@
+         }
+     }
+ 
++    fun playHit() { soundPool.play(hitSoundId,.35f,.35f,1,0,1f) }
++    fun playKill() { soundPool.play(killSoundId,.4f,.4f,1,0,1f) }
+     fun startBGM() {
+         if (!purchaseStore.isBgmEnabled()) return
+         try {
+--- before/app/src/main/res/values-en/renewal.xml
++++ after/app/src/main/res/values-en/renewal.xml
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="boss_warning">CHARGE — use Shock!</string>
++    <string name="shock_ready">Shock arrow</string>
++    <string name="shock_wait">Shock %1$ds</string>
++    <string name="choose_upgrade">Choose your upgrade</string>
++    <string name="battle_wave">Wave %1$d/%2$s · %3$ds</string>
++    <string name="screen_shake">Screen shake</string>
++    <string name="resume_checkpoint">Resume your saved battle?</string>
++    <string name="new_expedition">New expedition</string>
++    <string name="choose_weapon">Choose a bow style</string>
++    <string name="choose_mode">Choose a mode</string>
++    <string name="next_goals">Next goals: Pierce %1$d/500 score · Control %2$d/1 clear · First supply %3$d/1</string>
++    <string name="battle_feedback">Battle feedback</string>
++    <string name="chapter_clear">Chapter cleared! Control bow and Endless unlocked.</string>
++    <string name="defeated_by">Defense broken by: %1$s</string>
++    <string name="best_difference">Previous best difference: %1$+d</string>
++    <string name="try_shock">Use the free Shock arrow to interrupt charges and break shields.</string>
++    <string-array name="card_names">
++        <item>Piercing shaft</item>
++        <item>Heavy tip</item>
++        <item>Armor breaker</item>
++        <item>Frost edge</item>
++        <item>Deep freeze</item>
++        <item>Glacier</item>
++        <item>Ember</item>
++        <item>Lingering flame</item>
++        <item>Inferno</item>
++        <item>Quick draw</item>
++        <item>Twin arrows</item>
++        <item>Storm</item>
++    </string-array>
++    <string-array name="card_descriptions">
++        <item>+1 enemy pierced. Max 3.</item>
++        <item>+0.5 damage. Max 3.</item>
++        <item>Evolution: ignore shields. Requires Piercing 2 + Heavy tip 1.</item>
++        <item>Slow enemies on hit. Max 3.</item>
++        <item>+1s slow duration. Max 3.</item>
++        <item>Evolution: hits briefly stun. Requires Frost 2 + Deep freeze 1.</item>
++        <item>Apply burn damage. Max 3.</item>
++        <item>+1s burn duration. Max 3.</item>
++        <item>Evolution: burning kills spread fire. Requires Ember 2 + Flame 1.</item>
++        <item>10% less base shot cooldown per rank. Max 3.</item>
++        <item>Fire two arrows; +10% damage per additional rank. Max 3.</item>
++        <item>Evolution: 35% less shot cooldown. Requires Quick draw 2 + Twin arrows 1.</item>
++    </string-array>
++    <string-array name="archetypes">
++        <item>Rapid — available</item>
++        <item>Pierce — 500 best score</item>
++        <item>Control — clear chapter</item>
++    </string-array>
++    <string-array name="battle_modes">
++        <item>Chapter · 8 waves</item>
++        <item>Endless</item>
++    </string-array>
++    <string-array name="enemy_names">
++        <item>Raider</item>
++        <item>Runner</item>
++        <item>Brute</item>
++        <item>Shield knight</item>
++        <item>Summoner</item>
++        <item>Ash king</item>
++    </string-array>
++</resources>--- before/app/src/main/res/values-en/strings.xml
++++ after/app/src/main/res/values-en/strings.xml
+@@ -35,16 +35,16 @@
+     <string name="bow_seraphic_name">Seraphic Light Bow</string>
+     <string name="bow_abyss_name">Abyss Blood Bow</string>
+     <string name="bow_astra_name">Astra Gear Bow</string>
+-    <string name="bow_bonus_20">Attack Speed +20%</string>
+-    <string name="bow_bonus_30">Ultimate! Attack Speed +30%</string>
++    <string name="bow_bonus_20" formatted="false">Shot cooldown −20%</string>
++    <string name="bow_bonus_30" formatted="false">Shot cooldown −30%</string>
+ 
+     <!-- Battle Items -->
+     <string name="item_potion_name">Recovery Potion</string>
+-    <string name="item_potion_desc">Restores 1 Castle HP instantly</string>
++    <string name="item_potion_desc">Restore 3 HP, up to maximum.</string>
+     <string name="item_power_name">Power Arrow</string>
+-    <string name="item_power_desc">Attack Power +50% for 20s</string>
++    <string name="item_power_desc" formatted="false">Attack Power +50% for 20s</string>
+     <string name="item_slow_name">Time Slow Stone</string>
+-    <string name="item_slow_desc">Enemy Speed -50% for 10s</string>
++    <string name="item_slow_desc" formatted="false">Enemy Speed -50% for 10s</string>
+ 
+     <!-- Result Screen -->
+     <string name="game_over">GAME OVER</string>
+@@ -117,11 +117,11 @@
+     <string name="achievement_name_14">Overwhelming Defense</string>
+     <string name="achievement_desc_14">200 kills in one game</string>
+     <string name="achievement_name_15">Steady Aim</string>
+-    <string name="achievement_desc_15">50% accuracy in one game</string>
++    <string name="achievement_desc_15" formatted="false">50% accuracy in one game</string>
+     <string name="achievement_name_16">Accurate Archer</string>
+-    <string name="achievement_desc_16">70% accuracy in one game</string>
++    <string name="achievement_desc_16" formatted="false">70% accuracy in one game</string>
+     <string name="achievement_name_17">Master\'s Touch</string>
+-    <string name="achievement_desc_17">85% accuracy in one game</string>
++    <string name="achievement_desc_17" formatted="false">85% accuracy in one game</string>
+     <string name="achievement_name_18">100 Hits</string>
+     <string name="achievement_desc_18">100 cumulative hits</string>
+     <string name="achievement_name_19">500 Hits</string>
+@@ -181,13 +181,13 @@
+     <string name="achievement_name_46">Frugal Archer</string>
+     <string name="achievement_desc_46">Survive 180s without spending gold</string>
+     <string name="achievement_name_47">Focus Fire</string>
+-    <string name="achievement_desc_47">100+ kills and 60%+ accuracy</string>
++    <string name="achievement_desc_47" formatted="false">100+ kills and 60%+ accuracy</string>
+     <string name="achievement_name_48">Crisis Overcome</string>
+-    <string name="achievement_desc_48">Survive 30s with &lt; 30% HP</string>
++    <string name="achievement_desc_48" formatted="false">Survive 30s with &lt; 30% HP</string>
+     <string name="achievement_name_49">Balanced Battle</string>
+-    <string name="achievement_desc_49">180s survive, 50+ kills, 60%+ accuracy</string>
++    <string name="achievement_desc_49" formatted="false">180s survive, 50+ kills, 60%+ accuracy</string>
+     <string name="achievement_name_50">BowDefense</string>
+-    <string name="achievement_desc_50">600s survive, 300+ kills, 70%+ accuracy</string>
++    <string name="achievement_desc_50" formatted="false">600s survive, 300+ kills, 70%+ accuracy</string>
+     <string name="achievement_name_51">Battle Survivor</string>
+     <string name="achievement_desc_51">Use recovery potion 10 times</string>
+     <string name="achievement_name_52">Explosive Firepower</string>
+--- before/app/src/main/res/values-es/achievement_translations.xml
++++ after/app/src/main/res/values-es/achievement_translations.xml
+@@ -0,0 +1,119 @@
++<resources>
++<string name="achievement_name_1" formatted="false">Primera batalla</string>
++<string name="achievement_desc_1" formatted="false">Juega una batalla.</string>
++<string name="achievement_name_2" formatted="false">Primera baja</string>
++<string name="achievement_desc_2" formatted="false">Derrota a un enemigo.</string>
++<string name="achievement_name_3" formatted="false">Primer impacto</string>
++<string name="achievement_desc_3" formatted="false">Acierta una flecha.</string>
++<string name="achievement_name_4" formatted="false">Un minuto en pie</string>
++<string name="achievement_desc_4" formatted="false">Sobrevive 60 segundos en una batalla.</string>
++<string name="achievement_name_5" formatted="false">Tres minutos en pie</string>
++<string name="achievement_desc_5" formatted="false">Sobrevive 180 segundos en una batalla.</string>
++<string name="achievement_name_6" formatted="false">Cinco minutos en pie</string>
++<string name="achievement_desc_6" formatted="false">Sobrevive 300 segundos en una batalla.</string>
++<string name="achievement_name_7" formatted="false">La última muralla</string>
++<string name="achievement_desc_7" formatted="false">Sobrevive 600 segundos en una batalla.</string>
++<string name="achievement_name_8" formatted="false">Cazador novato</string>
++<string name="achievement_desc_8" formatted="false">Derrota a 50 enemigos en total.</string>
++<string name="achievement_name_9" formatted="false">Arquero de batalla</string>
++<string name="achievement_desc_9" formatted="false">Derrota a 200 enemigos en total.</string>
++<string name="achievement_name_10" formatted="false">Horda detenida</string>
++<string name="achievement_desc_10" formatted="false">Derrota a 500 enemigos en total.</string>
++<string name="achievement_name_11" formatted="false">Mil invasores</string>
++<string name="achievement_desc_11" formatted="false">Derrota a 1000 enemigos en total.</string>
++<string name="achievement_name_12" formatted="false">Concentración</string>
++<string name="achievement_desc_12" formatted="false">Derrota a 50 enemigos en una batalla.</string>
++<string name="achievement_name_13" formatted="false">Tormenta de bajas</string>
++<string name="achievement_desc_13" formatted="false">Derrota a 100 enemigos en una batalla.</string>
++<string name="achievement_name_14" formatted="false">Defensa abrumadora</string>
++<string name="achievement_desc_14" formatted="false">Derrota a 200 enemigos en una batalla.</string>
++<string name="achievement_name_15" formatted="false">Puntería firme</string>
++<string name="achievement_desc_15" formatted="false">Alcanza 50% de precisión en una batalla.</string>
++<string name="achievement_name_16" formatted="false">Arquero preciso</string>
++<string name="achievement_desc_16" formatted="false">Alcanza 70% de precisión en una batalla.</string>
++<string name="achievement_name_17" formatted="false">Maestro arquero</string>
++<string name="achievement_desc_17" formatted="false">Alcanza 85% de precisión en una batalla.</string>
++<string name="achievement_name_18" formatted="false">Cien impactos</string>
++<string name="achievement_desc_18" formatted="false">Acierta 100 flechas en total.</string>
++<string name="achievement_name_19" formatted="false">Quinientos impactos</string>
++<string name="achievement_desc_19" formatted="false">Acierta 500 flechas en total.</string>
++<string name="achievement_name_20" formatted="false">Mil impactos</string>
++<string name="achievement_desc_20" formatted="false">Acierta 1000 flechas en total.</string>
++<string name="achievement_name_21" formatted="false">Primera visita</string>
++<string name="achievement_desc_21" formatted="false">Visita la tienda una vez.</string>
++<string name="achievement_name_22" formatted="false">Primera compra</string>
++<string name="achievement_desc_22" formatted="false">Realiza 1 compras en total.</string>
++<string name="achievement_name_23" formatted="false">Preparación</string>
++<string name="achievement_desc_23" formatted="false">Realiza 5 compras en total.</string>
++<string name="achievement_name_24" formatted="false">Comprador veterano</string>
++<string name="achievement_desc_24" formatted="false">Realiza 20 compras en total.</string>
++<string name="achievement_name_25" formatted="false">Nuevo arco</string>
++<string name="achievement_desc_25" formatted="false">Equipa un arco distinto al inicial.</string>
++<string name="achievement_name_26" formatted="false">Arco único</string>
++<string name="achievement_desc_26" formatted="false">Consigue el arco Sangre abisal o Luz seráfica.</string>
++<string name="achievement_name_27" formatted="false">Primer coleccionista</string>
++<string name="achievement_desc_27" formatted="false">Posee al menos 2 arcos.</string>
++<string name="achievement_name_28" formatted="false">Colección completa</string>
++<string name="achievement_desc_28" formatted="false">Posee los 7 arcos de la tienda.</string>
++<string name="achievement_name_29" formatted="false">Recolector de oro</string>
++<string name="achievement_desc_29" formatted="false">Consigue 1000G en total.</string>
++<string name="achievement_name_30" formatted="false">Riqueza de batalla</string>
++<string name="achievement_desc_30" formatted="false">Consigue 5000G en total.</string>
++<string name="achievement_name_31" formatted="false">Arquero dorado</string>
++<string name="achievement_desc_31" formatted="false">Consigue 10000G en total.</string>
++<string name="achievement_name_32" formatted="false">Cien puntos</string>
++<string name="achievement_desc_32" formatted="false">Alcanza 100 puntos en una batalla.</string>
++<string name="achievement_name_33" formatted="false">Arquero en progreso</string>
++<string name="achievement_desc_33" formatted="false">Alcanza 1000 puntos en una batalla.</string>
++<string name="achievement_name_34" formatted="false">Prueba de habilidad</string>
++<string name="achievement_desc_34" formatted="false">Alcanza 3000 puntos en una batalla.</string>
++<string name="achievement_name_35" formatted="false">Gran puntuación</string>
++<string name="achievement_desc_35" formatted="false">Alcanza 5000 puntos en una batalla.</string>
++<string name="achievement_name_36" formatted="false">Récord legendario</string>
++<string name="achievement_desc_36" formatted="false">Alcanza 10000 puntos en una batalla.</string>
++<string name="achievement_name_37" formatted="false">Otra oportunidad</string>
++<string name="achievement_desc_37" formatted="false">Juega 5 batallas.</string>
++<string name="achievement_name_38" formatted="false">Defensor constante</string>
++<string name="achievement_desc_38" formatted="false">Juega 20 batallas.</string>
++<string name="achievement_name_39" formatted="false">Mejora diaria</string>
++<string name="achievement_desc_39" formatted="false">Juega 50 batallas.</string>
++<string name="achievement_name_40" formatted="false">Guardián</string>
++<string name="achievement_desc_40" formatted="false">Juega 100 batallas.</string>
++<string name="achievement_name_41" formatted="false">Etapa 2</string>
++<string name="achievement_desc_41" formatted="false">Alcanza la etapa 2.</string>
++<string name="achievement_name_42" formatted="false">Etapa 3</string>
++<string name="achievement_desc_42" formatted="false">Alcanza la etapa 3.</string>
++<string name="achievement_name_43" formatted="false">Oleada 5</string>
++<string name="achievement_desc_43" formatted="false">Alcanza la oleada 5.</string>
++<string name="achievement_name_44" formatted="false">Oleada 10</string>
++<string name="achievement_desc_44" formatted="false">Alcanza la oleada 10 en modo infinito.</string>
++<string name="achievement_name_45" formatted="false">Sin compras</string>
++<string name="achievement_desc_45" formatted="false">Sobrevive 120 s sin comprar suministros para esta batalla.</string>
++<string name="achievement_name_46" formatted="false">Ahorrador</string>
++<string name="achievement_desc_46" formatted="false">Sobrevive 180 s sin gastar oro en preparar esta batalla.</string>
++<string name="achievement_name_47" formatted="false">Concentración ofensiva</string>
++<string name="achievement_desc_47" formatted="false">Consigue 100 bajas y 60% de precisión en una batalla.</string>
++<string name="achievement_name_48" formatted="false">Superar la crisis</string>
++<string name="achievement_desc_48" formatted="false">Sobrevive 30 s seguidos con 30% de PV o menos.</string>
++<string name="achievement_name_49" formatted="false">Combate equilibrado</string>
++<string name="achievement_desc_49" formatted="false">Sobrevive 180 s, derrota a 50 enemigos y alcanza 60% de precisión.</string>
++<string name="achievement_name_50" formatted="false">Último defensor</string>
++<string name="achievement_desc_50" formatted="false">Sobrevive 600 s, derrota a 300 enemigos y alcanza 70% de precisión.</string>
++<string name="achievement_name_51" formatted="false">Superviviente</string>
++<string name="achievement_desc_51" formatted="false">Usa 10 pociones.</string>
++<string name="achievement_name_52" formatted="false">Potencia explosiva</string>
++<string name="achievement_desc_52" formatted="false">Usa 5 flechas potenciadas.</string>
++<string name="achievement_name_53" formatted="false">Señor del tiempo</string>
++<string name="achievement_desc_53" formatted="false">Usa 5 piedras de ralentización.</string>
++<string name="achievement_name_54" formatted="false">Salida de emergencia</string>
++<string name="achievement_desc_54" formatted="false">Usa una poción con 1 PV.</string>
++<string name="billing_loading" formatted="false">Cargando productos. Inténtalo de nuevo en un momento.</string>
++<string name="price_checking" formatted="false">Consultando precio…</string>
++<string name="summary_title" formatted="false">Resumen</string>
++<string name="recent_records_title" formatted="false">Últimas 10 batallas</string>
++<string name="loading" formatted="false">Cargando…</string>
++<string name="bow_list" formatted="false">Arcos</string>
++<string name="paused" formatted="false">PAUSA</string>
++<string name="resume" formatted="false">Continuar</string>
++<string name="exit" formatted="false">Salir</string>
++</resources>--- before/app/src/main/res/values-es/renewal.xml
++++ after/app/src/main/res/values-es/renewal.xml
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="boss_warning">¡CARGA: usa Impacto!</string>
++    <string name="shock_ready">Flecha de impacto</string>
++    <string name="shock_wait">Impacto %1$ds</string>
++    <string name="choose_upgrade">Elige una mejora</string>
++    <string name="battle_wave">Oleada %1$d/%2$s · %3$ds</string>
++    <string name="screen_shake">Vibración de cámara</string>
++    <string name="resume_checkpoint">¿Continuar la batalla guardada?</string>
++    <string name="new_expedition">Nueva expedición</string>
++    <string name="choose_weapon">Elige un estilo de arco</string>
++    <string name="choose_mode">Elige un modo</string>
++    <string name="next_goals">Metas: Perforación %1$d/500 puntos · Control %2$d/1 victoria · Suministro %3$d/1</string>
++    <string name="battle_feedback">Consejos de batalla</string>
++    <string name="chapter_clear">¡Capítulo superado! Arco de control y modo infinito desbloqueados.</string>
++    <string name="defeated_by">Defensa rota por: %1$s</string>
++    <string name="best_difference">Diferencia con récord anterior: %1$+d</string>
++    <string name="try_shock">Usa Impacto gratis para interrumpir cargas y romper escudos.</string>
++    <string-array name="card_names">
++        <item>Asta perforante</item>
++        <item>Punta pesada</item>
++        <item>Rompearmaduras</item>
++        <item>Filo helado</item>
++        <item>Congelación profunda</item>
++        <item>Glaciar</item>
++        <item>Ascua</item>
++        <item>Llama persistente</item>
++        <item>Infierno</item>
++        <item>Tiro veloz</item>
++        <item>Flechas gemelas</item>
++        <item>Tormenta</item>
++    </string-array>
++    <string-array name="card_descriptions">
++        <item>Perfora un enemigo más. Máx. 3.</item>
++        <item>+0,5 de daño. Máx. 3.</item>
++        <item>Evolución: ignora escudos. Requiere Perforante 2 + Punta 1.</item>
++        <item>Ralentiza al impactar. Máx. 3.</item>
++        <item>+1 s de ralentización. Máx. 3.</item>
++        <item>Evolución: aturde brevemente. Requiere Filo 2 + Congelación 1.</item>
++        <item>Aplica quemadura. Máx. 3.</item>
++        <item>+1 s de quemadura. Máx. 3.</item>
++        <item>Evolución: propaga fuego al matar. Requiere Ascua 2 + Llama 1.</item>
++        <item>Reduce 10% el tiempo base entre tiros por nivel. Máx. 3.</item>
++        <item>Dispara dos flechas; +10% de daño por nivel adicional. Máx. 3.</item>
++        <item>Evolución: 35% menos tiempo entre tiros. Requiere Tiro 2 + Gemelas 1.</item>
++    </string-array>
++    <string-array name="archetypes">
++        <item>Rápido — disponible</item>
++        <item>Perforante — récord de 500</item>
++        <item>Control — supera el capítulo</item>
++    </string-array>
++    <string-array name="battle_modes">
++        <item>Capítulo · 8 oleadas</item>
++        <item>Infinito</item>
++    </string-array>
++    <string-array name="enemy_names">
++        <item>Asaltante</item>
++        <item>Corredor</item>
++        <item>Bruto</item>
++        <item>Caballero escudado</item>
++        <item>Invocador</item>
++        <item>Rey de ceniza</item>
++    </string-array>
++</resources>--- before/app/src/main/res/values-es/strings.xml
++++ after/app/src/main/res/values-es/strings.xml
+@@ -35,16 +35,16 @@
+     <string name="bow_seraphic_name">Arco de Luz Seráfica</string>
+     <string name="bow_abyss_name">Arco de Sangre del Abismo</string>
+     <string name="bow_astra_name">Arco de Engranaje Astra</string>
+-    <string name="bow_bonus_20">Velocidad de Ataque +20%</string>
+-    <string name="bow_bonus_30">¡Definitivo! Velocidad de Ataque +30%</string>
++    <string name="bow_bonus_20" formatted="false">Intervalo entre tiros −20%</string>
++    <string name="bow_bonus_30" formatted="false">Intervalo entre tiros −30%</string>
+ 
+     <!-- Objetos de Batalla -->
+     <string name="item_potion_name">Poción de Recuperación</string>
+-    <string name="item_potion_desc">Restaura 1 PV del Castillo al instante</string>
++    <string name="item_potion_desc">Recupera 3 PV sin superar el máximo.</string>
+     <string name="item_power_name">Flecha de Poder</string>
+-    <string name="item_power_desc">Poder de Ataque +50% por 20s</string>
++    <string name="item_power_desc" formatted="false">Poder de Ataque +50% por 20s</string>
+     <string name="item_slow_name">Piedra de Lentitud</string>
+-    <string name="item_slow_desc">Velocidad Enemiga -50% por 10s</string>
++    <string name="item_slow_desc" formatted="false">Velocidad Enemiga -50% por 10s</string>
+ 
+     <!-- Pantalla de Resultados -->
+     <string name="game_over">FIN DEL JUEGO</string>
+@@ -95,7 +95,7 @@
+     <string name="summary_best_stage">Mejor Registro: Etapa %1$d - Onda %2$d</string>
+     <string name="summary_total_gold">Total de Oro: %dG</string>
+     <string name="no_records">Aún no hay registros de batalla.</string>
+-    <string name="achievement_progress">Progreso</string>
++    <string name="achievement_progress">Progreso: %1$d / %2$d</string>
+ 
+     <!-- Ajustes / Idioma -->
+     <string name="settings">Ajustes</string>
+@@ -105,4 +105,5 @@
+     <string name="vibration_setting">Vibración</string>
+     <string name="on">SÍ</string>
+     <string name="off">NO</string>
++<string name="battle_item_count_short">×%d</string>
+ </resources>
+--- before/app/src/main/res/values-ja/achievement_translations.xml
++++ after/app/src/main/res/values-ja/achievement_translations.xml
+@@ -0,0 +1,119 @@
++<resources>
++<string name="achievement_name_1" formatted="false">初めての戦闘</string>
++<string name="achievement_desc_1" formatted="false">戦闘を1回プレイ。</string>
++<string name="achievement_name_2" formatted="false">初めての撃破</string>
++<string name="achievement_desc_2" formatted="false">敵を1体撃破。</string>
++<string name="achievement_name_3" formatted="false">初めての命中</string>
++<string name="achievement_desc_3" formatted="false">矢を1回命中させる。</string>
++<string name="achievement_name_4" formatted="false">1分間の生存</string>
++<string name="achievement_desc_4" formatted="false">1回の戦闘で60秒生存。</string>
++<string name="achievement_name_5" formatted="false">3分間の生存</string>
++<string name="achievement_desc_5" formatted="false">1回の戦闘で180秒生存。</string>
++<string name="achievement_name_6" formatted="false">5分間の生存</string>
++<string name="achievement_desc_6" formatted="false">1回の戦闘で300秒生存。</string>
++<string name="achievement_name_7" formatted="false">最後の城壁</string>
++<string name="achievement_desc_7" formatted="false">1回の戦闘で600秒生存。</string>
++<string name="achievement_name_8" formatted="false">駆け出しの狩人</string>
++<string name="achievement_desc_8" formatted="false">累計50体の敵を撃破。</string>
++<string name="achievement_name_9" formatted="false">戦場の弓使い</string>
++<string name="achievement_desc_9" formatted="false">累計200体の敵を撃破。</string>
++<string name="achievement_name_10" formatted="false">群れを阻止</string>
++<string name="achievement_desc_10" formatted="false">累計500体の敵を撃破。</string>
++<string name="achievement_name_11" formatted="false">千の侵入者</string>
++<string name="achievement_desc_11" formatted="false">累計1000体の敵を撃破。</string>
++<string name="achievement_name_12" formatted="false">集中撃破</string>
++<string name="achievement_desc_12" formatted="false">1回の戦闘で50体撃破。</string>
++<string name="achievement_name_13" formatted="false">撃破の嵐</string>
++<string name="achievement_desc_13" formatted="false">1回の戦闘で100体撃破。</string>
++<string name="achievement_name_14" formatted="false">圧倒的な防衛</string>
++<string name="achievement_desc_14" formatted="false">1回の戦闘で200体撃破。</string>
++<string name="achievement_name_15" formatted="false">安定した照準</string>
++<string name="achievement_desc_15" formatted="false">1回の戦闘で命中率50%以上。</string>
++<string name="achievement_name_16" formatted="false">正確な弓使い</string>
++<string name="achievement_desc_16" formatted="false">1回の戦闘で命中率70%以上。</string>
++<string name="achievement_name_17" formatted="false">弓の達人</string>
++<string name="achievement_desc_17" formatted="false">1回の戦闘で命中率85%以上。</string>
++<string name="achievement_name_18" formatted="false">百回の命中</string>
++<string name="achievement_desc_18" formatted="false">矢を累計100回命中させる。</string>
++<string name="achievement_name_19" formatted="false">五百回の命中</string>
++<string name="achievement_desc_19" formatted="false">矢を累計500回命中させる。</string>
++<string name="achievement_name_20" formatted="false">千回の命中</string>
++<string name="achievement_desc_20" formatted="false">矢を累計1000回命中させる。</string>
++<string name="achievement_name_21" formatted="false">初めての来店</string>
++<string name="achievement_desc_21" formatted="false">ショップに1回入る。</string>
++<string name="achievement_name_22" formatted="false">初めての購入</string>
++<string name="achievement_desc_22" formatted="false">累計1回購入する。</string>
++<string name="achievement_name_23" formatted="false">戦闘準備</string>
++<string name="achievement_desc_23" formatted="false">累計5回購入する。</string>
++<string name="achievement_name_24" formatted="false">熟練の買い手</string>
++<string name="achievement_desc_24" formatted="false">累計20回購入する。</string>
++<string name="achievement_name_25" formatted="false">初めての弓変更</string>
++<string name="achievement_desc_25" formatted="false">初期装備以外の弓を装備。</string>
++<string name="achievement_name_26" formatted="false">特別な弓</string>
++<string name="achievement_desc_26" formatted="false">アビスブラッドまたはセラフィックライトの弓を所持。</string>
++<string name="achievement_name_27" formatted="false">収集の始まり</string>
++<string name="achievement_desc_27" formatted="false">弓を2種類以上所持。</string>
++<string name="achievement_name_28" formatted="false">すべての弓</string>
++<string name="achievement_desc_28" formatted="false">ショップの弓を7種類すべて所持。</string>
++<string name="achievement_name_29" formatted="false">ゴールド収集家</string>
++<string name="achievement_desc_29" formatted="false">累計1000Gを獲得。</string>
++<string name="achievement_name_30" formatted="false">戦場の富豪</string>
++<string name="achievement_desc_30" formatted="false">累計5000Gを獲得。</string>
++<string name="achievement_name_31" formatted="false">黄金の弓使い</string>
++<string name="achievement_desc_31" formatted="false">累計10000Gを獲得。</string>
++<string name="achievement_name_32" formatted="false">初めての100点</string>
++<string name="achievement_desc_32" formatted="false">1回の戦闘で100点を達成。</string>
++<string name="achievement_name_33" formatted="false">成長する弓使い</string>
++<string name="achievement_desc_33" formatted="false">1回の戦闘で1000点を達成。</string>
++<string name="achievement_name_34" formatted="false">実力の証明</string>
++<string name="achievement_desc_34" formatted="false">1回の戦闘で3000点を達成。</string>
++<string name="achievement_name_35" formatted="false">高得点の狩人</string>
++<string name="achievement_desc_35" formatted="false">1回の戦闘で5000点を達成。</string>
++<string name="achievement_name_36" formatted="false">伝説の記録</string>
++<string name="achievement_desc_36" formatted="false">1回の戦闘で10000点を達成。</string>
++<string name="achievement_name_37" formatted="false">再挑戦</string>
++<string name="achievement_desc_37" formatted="false">戦闘を5回プレイ。</string>
++<string name="achievement_name_38" formatted="false">堅実な守り手</string>
++<string name="achievement_desc_38" formatted="false">戦闘を20回プレイ。</string>
++<string name="achievement_name_39" formatted="false">日々の成長</string>
++<string name="achievement_desc_39" formatted="false">戦闘を50回プレイ。</string>
++<string name="achievement_name_40" formatted="false">守護者</string>
++<string name="achievement_desc_40" formatted="false">戦闘を100回プレイ。</string>
++<string name="achievement_name_41" formatted="false">ステージ2到達</string>
++<string name="achievement_desc_41" formatted="false">ステージ2に到達。</string>
++<string name="achievement_name_42" formatted="false">ステージ3到達</string>
++<string name="achievement_desc_42" formatted="false">ステージ3に到達。</string>
++<string name="achievement_name_43" formatted="false">第5ウェーブ到達</string>
++<string name="achievement_desc_43" formatted="false">第5ウェーブに到達。</string>
++<string name="achievement_name_44" formatted="false">第10ウェーブ到達</string>
++<string name="achievement_desc_44" formatted="false">無限モードで第10ウェーブに到達。</string>
++<string name="achievement_name_45" formatted="false">購入なしで生存</string>
++<string name="achievement_desc_45" formatted="false">今回の補給品を購入せずに120秒生存。</string>
++<string name="achievement_name_46" formatted="false">節約する弓使い</string>
++<string name="achievement_desc_46" formatted="false">今回の準備にゴールドを使わず180秒生存。</string>
++<string name="achievement_name_47" formatted="false">攻撃に集中</string>
++<string name="achievement_desc_47" formatted="false">1回の戦闘で100体撃破、命中率60%以上。</string>
++<string name="achievement_name_48" formatted="false">危機の克服</string>
++<string name="achievement_desc_48" formatted="false">HP30%以下で30秒連続生存。</string>
++<string name="achievement_name_49" formatted="false">均衡した戦闘</string>
++<string name="achievement_desc_49" formatted="false">1回の戦闘で180秒生存、50体撃破、命中率60%以上。</string>
++<string name="achievement_name_50" formatted="false">最後の守り手</string>
++<string name="achievement_desc_50" formatted="false">1回の戦闘で600秒生存、300体撃破、命中率70%以上。</string>
++<string name="achievement_name_51" formatted="false">戦場の生存者</string>
++<string name="achievement_desc_51" formatted="false">回復薬を10回使用。</string>
++<string name="achievement_name_52" formatted="false">爆発的な火力</string>
++<string name="achievement_desc_52" formatted="false">強化矢を5回使用。</string>
++<string name="achievement_name_53" formatted="false">時間の支配者</string>
++<string name="achievement_desc_53" formatted="false">減速石を5回使用。</string>
++<string name="achievement_name_54" formatted="false">危機から脱出</string>
++<string name="achievement_desc_54" formatted="false">HP1で回復薬を使用。</string>
++<string name="billing_loading" formatted="false">商品情報を取得中です。少し待ってから再試行してください。</string>
++<string name="price_checking" formatted="false">価格を確認中…</string>
++<string name="summary_title" formatted="false">全体の記録</string>
++<string name="recent_records_title" formatted="false">最近の10戦</string>
++<string name="loading" formatted="false">読み込み中…</string>
++<string name="bow_list" formatted="false">弓一覧</string>
++<string name="paused" formatted="false">一時停止</string>
++<string name="resume" formatted="false">再開</string>
++<string name="exit" formatted="false">終了</string>
++</resources>--- before/app/src/main/res/values-ja/renewal.xml
++++ after/app/src/main/res/values-ja/renewal.xml
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="boss_warning">突進準備 — 衝撃矢で阻止！</string>
++    <string name="shock_ready">衝撃矢</string>
++    <string name="shock_wait">衝撃 %1$d秒</string>
++    <string name="choose_upgrade">強化を選択</string>
++    <string name="battle_wave">ウェーブ %1$d/%2$s · %3$d秒</string>
++    <string name="screen_shake">画面の揺れ</string>
++    <string name="resume_checkpoint">保存した戦闘を再開しますか？</string>
++    <string name="new_expedition">新しい遠征</string>
++    <string name="choose_weapon">弓の戦闘スタイル</string>
++    <string name="choose_mode">モードを選択</string>
++    <string name="next_goals">目標：貫通 %1$d/500点 · 制御 %2$d/1クリア · 初補給 %3$d/1</string>
++    <string name="battle_feedback">戦闘アドバイス</string>
++    <string name="chapter_clear">チャプタークリア！制御弓と無限モードを解放。</string>
++    <string name="defeated_by">防衛線を突破した敵：%1$s</string>
++    <string name="best_difference">以前の最高記録との差：%1$+d</string>
++    <string name="try_shock">無料の衝撃矢で突進を止め、盾を突破しましょう。</string>
++    <string-array name="card_names">
++        <item>貫通矢</item>
++        <item>重い矢じり</item>
++        <item>装甲破壊</item>
++        <item>氷の矢</item>
++        <item>深い冷気</item>
++        <item>氷河</item>
++        <item>火種</item>
++        <item>持続する炎</item>
++        <item>業火</item>
++        <item>速射</item>
++        <item>双矢</item>
++        <item>嵐</item>
++    </string-array>
++    <string-array name="card_descriptions">
++        <item>追加で敵1体を貫通。最大3。</item>
++        <item>ダメージ+0.5。最大3。</item>
++        <item>進化：盾を無視。貫通2＋矢じり1が必要。</item>
++        <item>命中時に敵を減速。最大3。</item>
++        <item>減速時間+1秒。最大3。</item>
++        <item>進化：命中時に短く気絶。氷2＋冷気1が必要。</item>
++        <item>火傷ダメージを付与。最大3。</item>
++        <item>火傷時間+1秒。最大3。</item>
++        <item>進化：撃破で周囲に炎。火種2＋炎1が必要。</item>
++        <item>段階ごとに基本発射間隔を10%短縮。最大3。</item>
++        <item>矢を2本発射。追加段階ごとに威力+10%。最大3。</item>
++        <item>進化：発射間隔を35%短縮。速射2＋双矢1が必要。</item>
++    </string-array>
++    <string-array name="archetypes">
++        <item>速射 — 解放済み</item>
++        <item>貫通 — 最高500点</item>
++        <item>制御 — チャプタークリア</item>
++    </string-array>
++    <string-array name="battle_modes">
++        <item>チャプター · 8ウェーブ</item>
++        <item>無限</item>
++    </string-array>
++    <string-array name="enemy_names">
++        <item>侵入者</item>
++        <item>疾走者</item>
++        <item>巨漢</item>
++        <item>盾兵</item>
++        <item>召喚士</item>
++        <item>灰の王</item>
++    </string-array>
++</resources>--- before/app/src/main/res/values-ja/strings.xml
++++ after/app/src/main/res/values-ja/strings.xml
+@@ -35,16 +35,16 @@
+     <string name="bow_seraphic_name">セラフィックライトボウ</string>
+     <string name="bow_abyss_name">アビスブラッドボウ</string>
+     <string name="bow_astra_name">アストラギアボウ</string>
+-    <string name="bow_bonus_20">攻撃速度 20% 増加</string>
+-    <string name="bow_bonus_30">最強の性能！攻撃速度 30% 増加</string>
++    <string name="bow_bonus_20" formatted="false">発射間隔20%短縮</string>
++    <string name="bow_bonus_30" formatted="false">発射間隔30%短縮</string>
+ 
+     <!-- バトルアイテム -->
+     <string name="item_potion_name">回復ポーション</string>
+-    <string name="item_potion_desc">城の体力を 1 回復</string>
++    <string name="item_potion_desc">HPを3回復。最大HPを超えません。</string>
+     <string name="item_power_name">強化矢</string>
+-    <string name="item_power_desc">20秒間、攻撃力が 50% 増加</string>
++    <string name="item_power_desc" formatted="false">20秒間、攻撃力が 50% 増加</string>
+     <string name="item_slow_name">タイムスロウストーン</string>
+-    <string name="item_slow_desc">10秒間、敵の移動速度が 50% 減少</string>
++    <string name="item_slow_desc" formatted="false">10秒間、敵の移動速度が 50% 減少</string>
+ 
+     <!-- 結果画面 -->
+     <string name="game_over">ゲームオーバー</string>
+@@ -95,7 +95,7 @@
+     <string name="summary_best_stage">最高記録: ステージ %1$d - ウェーブ %2$d</string>
+     <string name="summary_total_gold">累計獲得ゴールド: %dG</string>
+     <string name="no_records">まだ戦績がありません。</string>
+-    <string name="achievement_progress">達成率</string>
++    <string name="achievement_progress">達成率: %1$d / %2$d</string>
+ 
+     <!-- 設定 / 言語 -->
+     <string name="settings">設定</string>
+@@ -105,4 +105,5 @@
+     <string name="vibration_setting">振動</string>
+     <string name="on">ON</string>
+     <string name="off">OFF</string>
++<string name="battle_item_count_short">×%d</string>
+ </resources>
+--- before/app/src/main/res/values-ko/renewal.xml
++++ after/app/src/main/res/values-ko/renewal.xml
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="boss_warning">돌진 준비 — 충격 화살로 저지!</string>
++    <string name="shock_ready">충격 화살</string>
++    <string name="shock_wait">충격 %1$d초</string>
++    <string name="choose_upgrade">강화 선택</string>
++    <string name="battle_wave">웨이브 %1$d/%2$s · %3$d초</string>
++    <string name="screen_shake">화면 흔들림</string>
++    <string name="resume_checkpoint">저장된 전투를 이어할까요?</string>
++    <string name="new_expedition">새 원정</string>
++    <string name="choose_weapon">활 전투 방식 선택</string>
++    <string name="choose_mode">모드 선택</string>
++    <string name="next_goals">다음 목표: 관통 %1$d/500점 · 제어 %2$d/1 클리어 · 첫 보급품 %3$d/1</string>
++    <string name="battle_feedback">전투 피드백</string>
++    <string name="chapter_clear">챕터 클리어! 제어 활과 무한 모드가 열렸습니다.</string>
++    <string name="defeated_by">방어선 돌파: %1$s</string>
++    <string name="best_difference">이전 최고 기록 대비: %1$+d점</string>
++    <string name="try_shock">무료 충격 화살로 돌진을 저지하고 방패를 돌파해 보세요.</string>
++    <string-array name="card_names">
++        <item>관통 화살</item>
++        <item>중량 화살촉</item>
++        <item>방어구 파괴</item>
++        <item>냉기 화살</item>
++        <item>깊은 냉기</item>
++        <item>빙하</item>
++        <item>불씨</item>
++        <item>지속 화염</item>
++        <item>지옥불</item>
++        <item>빠른 시위</item>
++        <item>쌍화살</item>
++        <item>폭풍</item>
++    </string-array>
++    <string-array name="card_descriptions">
++        <item>적 1명 추가 관통. 최대 3단계.</item>
++        <item>피해량 +0.5. 최대 3단계.</item>
++        <item>진화: 방패 무시. 관통 2 + 중량 1 필요.</item>
++        <item>명중 시 적을 둔화. 최대 3단계.</item>
++        <item>둔화 지속 +1초. 최대 3단계.</item>
++        <item>진화: 명중 시 잠시 기절. 냉기 2 + 깊은 냉기 1 필요.</item>
++        <item>지속 화상 피해. 최대 3단계.</item>
++        <item>화상 지속 +1초. 최대 3단계.</item>
++        <item>진화: 처치 시 주변에 화염 전파. 불씨 2 + 지속 화염 1 필요.</item>
++        <item>단계마다 기본 발사 대기시간 10% 감소. 최대 3단계.</item>
++        <item>화살 2발 발사. 추가 단계마다 피해 +10%. 최대 3단계.</item>
++        <item>진화: 발사 대기시간 35% 감소. 빠른 시위 2 + 쌍화살 1 필요.</item>
++    </string-array>
++    <string-array name="archetypes">
++        <item>연사 — 기본 해금</item>
++        <item>관통 — 최고 500점</item>
++        <item>제어 — 챕터 클리어</item>
++    </string-array>
++    <string-array name="battle_modes">
++        <item>챕터 · 8웨이브</item>
++        <item>무한 모드</item>
++    </string-array>
++    <string-array name="enemy_names">
++        <item>침입자</item>
++        <item>질주자</item>
++        <item>거한</item>
++        <item>방패병</item>
++        <item>소환사</item>
++        <item>잿빛 군주</item>
++    </string-array>
++</resources>--- before/app/src/main/res/values-ko/strings.xml
++++ after/app/src/main/res/values-ko/strings.xml
+@@ -35,16 +35,16 @@
+     <string name="bow_seraphic_name">세라픽 라이트 보우</string>
+     <string name="bow_abyss_name">어비스 블러드 보우</string>
+     <string name="bow_astra_name">아스트라 기어 보우</string>
+-    <string name="bow_bonus_20">공격 속도 20% 증가</string>
+-    <string name="bow_bonus_30">최강의 성능! 공격 속도 30% 증가</string>
++    <string name="bow_bonus_20" formatted="false">발사 대기시간 20% 감소</string>
++    <string name="bow_bonus_30" formatted="false">발사 대기시간 30% 감소</string>
+ 
+     <!-- 전투 아이템 -->
+     <string name="item_potion_name">회복 물약</string>
+-    <string name="item_potion_desc">즉시 성 체력 1 회복</string>
++    <string name="item_potion_desc">체력을 3 회복합니다. 최대 체력을 넘지 않습니다.</string>
+     <string name="item_power_name">강화 화살</string>
+-    <string name="item_power_desc">20초 동안 공격력 50% 증가</string>
++    <string name="item_power_desc" formatted="false">20초 동안 공격력 50% 증가</string>
+     <string name="item_slow_name">시간 지연석</string>
+-    <string name="item_slow_desc">10초 동안 적 이동속도 50% 감소</string>
++    <string name="item_slow_desc" formatted="false">10초 동안 적 이동속도 50% 감소</string>
+ 
+     <!-- 결과 화면 -->
+     <string name="game_over">게임 오버</string>
+@@ -117,11 +117,11 @@
+     <string name="achievement_name_14">압도적인 방어</string>
+     <string name="achievement_desc_14">한 판 200킬</string>
+     <string name="achievement_name_15">안정적인 조준</string>
+-    <string name="achievement_desc_15">한 판 명중률 50% 이상</string>
++    <string name="achievement_desc_15" formatted="false">한 판 명중률 50% 이상</string>
+     <string name="achievement_name_16">정확한 궁수</string>
+-    <string name="achievement_desc_16">한 판 명중률 70% 이상</string>
++    <string name="achievement_desc_16" formatted="false">한 판 명중률 70% 이상</string>
+     <string name="achievement_name_17">명궁의 손끝</string>
+-    <string name="achievement_desc_17">한 판 명중률 85% 이상</string>
++    <string name="achievement_desc_17" formatted="false">한 판 명중률 85% 이상</string>
+     <string name="achievement_name_18">누적 명중 100회</string>
+     <string name="achievement_desc_18">누적 100회 명중</string>
+     <string name="achievement_name_19">누적 명중 500회</string>
+@@ -181,13 +181,13 @@
+     <string name="achievement_name_46">절약형 궁수</string>
+     <string name="achievement_desc_46">한 판에서 골드 사용 없이 180초 생존</string>
+     <string name="achievement_name_47">공격 집중</string>
+-    <string name="achievement_desc_47">한 판에서 100킬 이상, 명중률 60% 이상</string>
++    <string name="achievement_desc_47" formatted="false">한 판에서 100킬 이상, 명중률 60% 이상</string>
+     <string name="achievement_name_48">위기 극복</string>
+-    <string name="achievement_desc_48">체력이 30% 이하인 상태에서 30초 이상 추가 생존</string>
++    <string name="achievement_desc_48" formatted="false">체력이 30% 이하인 상태에서 30초 이상 추가 생존</string>
+     <string name="achievement_name_49">균형 잡힌 전투</string>
+-    <string name="achievement_desc_49">한 판에서 180초 생존, 50킬 이상, 명중률 60% 이상</string>
++    <string name="achievement_desc_49" formatted="false">한 판에서 180초 생존, 50킬 이상, 명중률 60% 이상</string>
+     <string name="achievement_name_50">BowDefense</string>
+-    <string name="achievement_desc_50">한 판에서 600초 생존, 300킬 이상, 명중률 70% 이상</string>
++    <string name="achievement_desc_50" formatted="false">한 판에서 600초 생존, 300킬 이상, 명중률 70% 이상</string>
+     <string name="achievement_name_51">전장의 생존가</string>
+     <string name="achievement_desc_51">회복 물약 10회 사용</string>
+     <string name="achievement_name_52">폭발적인 화력</string>
+@@ -205,7 +205,7 @@
+     <string name="summary_best_stage">최고 기록: Stage %1$d - Wave %2$d</string>
+     <string name="summary_total_gold">총 획득 골드: %dG</string>
+     <string name="no_records">아직 전투 기록이 없습니다.</string>
+-    <string name="achievement_progress">달성률</string>
++    <string name="achievement_progress">달성률: %1$d / %2$d</string>
+     <string name="billing_loading">상품 정보를 불러오는 중입니다. 잠시 후 다시 시도해 주세요.</string>
+     <string name="price_checking">가격 확인 중</string>
+     <string name="summary_title">전체 요약</string>
+@@ -224,4 +224,5 @@
+     <string name="vibration_setting">진동</string>
+     <string name="on">ON</string>
+     <string name="off">OFF</string>
++<string name="battle_item_count_short">×%d</string>
+ </resources>
+--- before/app/src/main/res/values-zh/achievement_translations.xml
++++ after/app/src/main/res/values-zh/achievement_translations.xml
+@@ -0,0 +1,119 @@
++<resources>
++<string name="achievement_name_1" formatted="false">首次战斗</string>
++<string name="achievement_desc_1" formatted="false">进行1场战斗。</string>
++<string name="achievement_name_2" formatted="false">首次击杀</string>
++<string name="achievement_desc_2" formatted="false">击败1个敌人。</string>
++<string name="achievement_name_3" formatted="false">首次命中</string>
++<string name="achievement_desc_3" formatted="false">命中1支箭。</string>
++<string name="achievement_name_4" formatted="false">生存一分钟</string>
++<string name="achievement_desc_4" formatted="false">单场生存60秒。</string>
++<string name="achievement_name_5" formatted="false">生存三分钟</string>
++<string name="achievement_desc_5" formatted="false">单场生存180秒。</string>
++<string name="achievement_name_6" formatted="false">生存五分钟</string>
++<string name="achievement_desc_6" formatted="false">单场生存300秒。</string>
++<string name="achievement_name_7" formatted="false">最后的城墙</string>
++<string name="achievement_desc_7" formatted="false">单场生存600秒。</string>
++<string name="achievement_name_8" formatted="false">新手猎人</string>
++<string name="achievement_desc_8" formatted="false">累计击败50个敌人。</string>
++<string name="achievement_name_9" formatted="false">战场弓手</string>
++<string name="achievement_desc_9" formatted="false">累计击败200个敌人。</string>
++<string name="achievement_name_10" formatted="false">阻挡兽潮</string>
++<string name="achievement_desc_10" formatted="false">累计击败500个敌人。</string>
++<string name="achievement_name_11" formatted="false">千名入侵者</string>
++<string name="achievement_desc_11" formatted="false">累计击败1000个敌人。</string>
++<string name="achievement_name_12" formatted="false">专注击杀</string>
++<string name="achievement_desc_12" formatted="false">单场击败50个敌人。</string>
++<string name="achievement_name_13" formatted="false">击杀风暴</string>
++<string name="achievement_desc_13" formatted="false">单场击败100个敌人。</string>
++<string name="achievement_name_14" formatted="false">压倒性防御</string>
++<string name="achievement_desc_14" formatted="false">单场击败200个敌人。</string>
++<string name="achievement_name_15" formatted="false">稳定瞄准</string>
++<string name="achievement_desc_15" formatted="false">单场命中率达到50%。</string>
++<string name="achievement_name_16" formatted="false">精准弓手</string>
++<string name="achievement_desc_16" formatted="false">单场命中率达到70%。</string>
++<string name="achievement_name_17" formatted="false">神射手</string>
++<string name="achievement_desc_17" formatted="false">单场命中率达到85%。</string>
++<string name="achievement_name_18" formatted="false">百次命中</string>
++<string name="achievement_desc_18" formatted="false">累计命中100支箭。</string>
++<string name="achievement_name_19" formatted="false">五百次命中</string>
++<string name="achievement_desc_19" formatted="false">累计命中500支箭。</string>
++<string name="achievement_name_20" formatted="false">千次命中</string>
++<string name="achievement_desc_20" formatted="false">累计命中1000支箭。</string>
++<string name="achievement_name_21" formatted="false">首次到店</string>
++<string name="achievement_desc_21" formatted="false">进入商店1次。</string>
++<string name="achievement_name_22" formatted="false">首次购买</string>
++<string name="achievement_desc_22" formatted="false">累计购买1次。</string>
++<string name="achievement_name_23" formatted="false">战前准备</string>
++<string name="achievement_desc_23" formatted="false">累计购买5次。</string>
++<string name="achievement_name_24" formatted="false">战斗采购者</string>
++<string name="achievement_desc_24" formatted="false">累计购买20次。</string>
++<string name="achievement_name_25" formatted="false">首次换弓</string>
++<string name="achievement_desc_25" formatted="false">装备初始弓以外的弓。</string>
++<string name="achievement_name_26" formatted="false">独特弓箭</string>
++<string name="achievement_desc_26" formatted="false">拥有深渊血弓或炽天使光弓。</string>
++<string name="achievement_name_27" formatted="false">收藏起步</string>
++<string name="achievement_desc_27" formatted="false">拥有至少2把弓。</string>
++<string name="achievement_name_28" formatted="false">完整收藏</string>
++<string name="achievement_desc_28" formatted="false">拥有商店中的全部7把弓。</string>
++<string name="achievement_name_29" formatted="false">金币收集者</string>
++<string name="achievement_desc_29" formatted="false">累计获得1000金币。</string>
++<string name="achievement_name_30" formatted="false">战场富豪</string>
++<string name="achievement_desc_30" formatted="false">累计获得5000金币。</string>
++<string name="achievement_name_31" formatted="false">黄金弓手</string>
++<string name="achievement_desc_31" formatted="false">累计获得10000金币。</string>
++<string name="achievement_name_32" formatted="false">首次百分</string>
++<string name="achievement_desc_32" formatted="false">单场达到100分。</string>
++<string name="achievement_name_33" formatted="false">成长中的弓手</string>
++<string name="achievement_desc_33" formatted="false">单场达到1000分。</string>
++<string name="achievement_name_34" formatted="false">实力证明</string>
++<string name="achievement_desc_34" formatted="false">单场达到3000分。</string>
++<string name="achievement_name_35" formatted="false">高分猎手</string>
++<string name="achievement_desc_35" formatted="false">单场达到5000分。</string>
++<string name="achievement_name_36" formatted="false">传奇纪录</string>
++<string name="achievement_desc_36" formatted="false">单场达到10000分。</string>
++<string name="achievement_name_37" formatted="false">再次挑战</string>
++<string name="achievement_desc_37" formatted="false">进行5场战斗。</string>
++<string name="achievement_name_38" formatted="false">坚定守卫</string>
++<string name="achievement_desc_38" formatted="false">进行20场战斗。</string>
++<string name="achievement_name_39" formatted="false">日益精进</string>
++<string name="achievement_desc_39" formatted="false">进行50场战斗。</string>
++<string name="achievement_name_40" formatted="false">守护者</string>
++<string name="achievement_desc_40" formatted="false">进行100场战斗。</string>
++<string name="achievement_name_41" formatted="false">到达阶段2</string>
++<string name="achievement_desc_41" formatted="false">到达阶段2。</string>
++<string name="achievement_name_42" formatted="false">到达阶段3</string>
++<string name="achievement_desc_42" formatted="false">到达阶段3。</string>
++<string name="achievement_name_43" formatted="false">到达第5波</string>
++<string name="achievement_desc_43" formatted="false">到达第5波。</string>
++<string name="achievement_name_44" formatted="false">到达第10波</string>
++<string name="achievement_desc_44" formatted="false">在无尽模式中到达第10波。</string>
++<string name="achievement_name_45" formatted="false">无购买生存</string>
++<string name="achievement_desc_45" formatted="false">未为本场购买补给，生存120秒。</string>
++<string name="achievement_name_46" formatted="false">节俭弓手</string>
++<string name="achievement_desc_46" formatted="false">未花金币准备本场战斗，生存180秒。</string>
++<string name="achievement_name_47" formatted="false">专注进攻</string>
++<string name="achievement_desc_47" formatted="false">单场击败100个敌人且命中率达到60%。</string>
++<string name="achievement_name_48" formatted="false">渡过危机</string>
++<string name="achievement_desc_48" formatted="false">生命不高于30%时连续生存30秒。</string>
++<string name="achievement_name_49" formatted="false">均衡战斗</string>
++<string name="achievement_desc_49" formatted="false">单场生存180秒、击败50个敌人且命中率达到60%。</string>
++<string name="achievement_name_50" formatted="false">最后的守卫</string>
++<string name="achievement_desc_50" formatted="false">单场生存600秒、击败300个敌人且命中率达到70%。</string>
++<string name="achievement_name_51" formatted="false">战场生存者</string>
++<string name="achievement_desc_51" formatted="false">使用10次恢复药水。</string>
++<string name="achievement_name_52" formatted="false">爆发火力</string>
++<string name="achievement_desc_52" formatted="false">使用5次强化箭。</string>
++<string name="achievement_name_53" formatted="false">时间支配者</string>
++<string name="achievement_desc_53" formatted="false">使用5次减速石。</string>
++<string name="achievement_name_54" formatted="false">紧急脱险</string>
++<string name="achievement_desc_54" formatted="false">生命为1时使用恢复药水。</string>
++<string name="billing_loading" formatted="false">正在加载商品，请稍后重试。</string>
++<string name="price_checking" formatted="false">查询价格中…</string>
++<string name="summary_title" formatted="false">总览</string>
++<string name="recent_records_title" formatted="false">最近10场战斗</string>
++<string name="loading" formatted="false">加载中…</string>
++<string name="bow_list" formatted="false">弓箭列表</string>
++<string name="paused" formatted="false">已暂停</string>
++<string name="resume" formatted="false">继续</string>
++<string name="exit" formatted="false">退出</string>
++</resources>--- before/app/src/main/res/values-zh/renewal.xml
++++ after/app/src/main/res/values-zh/renewal.xml
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="boss_warning">即将冲锋——用冲击箭打断！</string>
++    <string name="shock_ready">冲击箭</string>
++    <string name="shock_wait">冲击 %1$d秒</string>
++    <string name="choose_upgrade">选择强化</string>
++    <string name="battle_wave">波次 %1$d/%2$s · %3$d秒</string>
++    <string name="screen_shake">画面震动</string>
++    <string name="resume_checkpoint">继续已保存的战斗？</string>
++    <string name="new_expedition">新征程</string>
++    <string name="choose_weapon">选择弓箭流派</string>
++    <string name="choose_mode">选择模式</string>
++    <string name="next_goals">目标：贯穿 %1$d/500分 · 控制 %2$d/1通关 · 首次补给 %3$d/1</string>
++    <string name="battle_feedback">战斗建议</string>
++    <string name="chapter_clear">章节通关！已解锁控制弓和无尽模式。</string>
++    <string name="defeated_by">突破防线的敌人：%1$s</string>
++    <string name="best_difference">与之前最高分之差：%1$+d</string>
++    <string name="try_shock">使用免费冲击箭打断冲锋并击破护盾。</string>
++    <string-array name="card_names">
++        <item>贯穿箭</item>
++        <item>重箭头</item>
++        <item>破甲</item>
++        <item>冰霜箭</item>
++        <item>深度冰冻</item>
++        <item>冰川</item>
++        <item>火种</item>
++        <item>持续烈焰</item>
++        <item>地狱火</item>
++        <item>快速拉弦</item>
++        <item>双箭</item>
++        <item>风暴</item>
++    </string-array>
++    <string-array name="card_descriptions">
++        <item>额外贯穿1个敌人。最高3级。</item>
++        <item>伤害+0.5。最高3级。</item>
++        <item>进化：无视护盾。需要贯穿2级＋重箭头1级。</item>
++        <item>命中使敌人减速。最高3级。</item>
++        <item>减速持续时间+1秒。最高3级。</item>
++        <item>进化：命中短暂眩晕。需要冰霜2级＋深冻1级。</item>
++        <item>附加灼烧伤害。最高3级。</item>
++        <item>灼烧持续时间+1秒。最高3级。</item>
++        <item>进化：击杀传播火焰。需要火种2级＋烈焰1级。</item>
++        <item>每级基础射击间隔减少10%。最高3级。</item>
++        <item>发射双箭；后续每级伤害+10%。最高3级。</item>
++        <item>进化：射击间隔减少35%。需要快速拉弦2级＋双箭1级。</item>
++    </string-array>
++    <string-array name="archetypes">
++        <item>速射——已解锁</item>
++        <item>贯穿——最高500分</item>
++        <item>控制——章节通关</item>
++    </string-array>
++    <string-array name="battle_modes">
++        <item>章节 · 8波</item>
++        <item>无尽模式</item>
++    </string-array>
++    <string-array name="enemy_names">
++        <item>入侵者</item>
++        <item>疾行者</item>
++        <item>巨汉</item>
++        <item>盾兵</item>
++        <item>召唤师</item>
++        <item>灰烬之王</item>
++    </string-array>
++</resources>--- before/app/src/main/res/values-zh/strings.xml
++++ after/app/src/main/res/values-zh/strings.xml
+@@ -35,16 +35,16 @@
+     <string name="bow_seraphic_name">炽天使之光弓</string>
+     <string name="bow_abyss_name">深渊之血弓</string>
+     <string name="bow_astra_name">阿斯特拉齿轮弓</string>
+-    <string name="bow_bonus_20">攻击速度提高 20%</string>
+-    <string name="bow_bonus_30">最强性能！攻击速度提高 30%</string>
++    <string name="bow_bonus_20" formatted="false">射击间隔减少20%</string>
++    <string name="bow_bonus_30" formatted="false">射击间隔减少30%</string>
+ 
+     <!-- 战斗道具 -->
+     <string name="item_potion_name">恢复药水</string>
+-    <string name="item_potion_desc">立即恢复 1 点城堡生命值</string>
++    <string name="item_potion_desc">恢复3点生命，不超过上限。</string>
+     <string name="item_power_name">强化箭矢</string>
+-    <string name="item_power_desc">20秒内攻击力增加 50%</string>
++    <string name="item_power_desc" formatted="false">20秒内攻击力增加 50%</string>
+     <string name="item_slow_name">时间迟缓石</string>
+-    <string name="item_slow_desc">10秒内敌人移动速度降低 50%</string>
++    <string name="item_slow_desc" formatted="false">10秒内敌人移动速度降低 50%</string>
+ 
+     <!-- 结果屏幕 -->
+     <string name="game_over">游戏结束</string>
+@@ -95,7 +95,7 @@
+     <string name="summary_best_stage">最高记录: 关卡 %1$d - 波次 %2$d</string>
+     <string name="summary_total_gold">总获得金币: %dG</string>
+     <string name="no_records">还没有战斗记录。</string>
+-    <string name="achievement_progress">达成率</string>
++    <string name="achievement_progress">达成率: %1$d / %2$d</string>
+ 
+     <!-- 设置 / 语言 -->
+     <string name="settings">设置</string>
+@@ -105,4 +105,5 @@
+     <string name="vibration_setting">振动</string>
+     <string name="on">开启</string>
+     <string name="off">关闭</string>
++<string name="battle_item_count_short">×%d</string>
+ </resources>
+--- before/app/src/main/res/values/battle_styles.xml
++++ after/app/src/main/res/values/battle_styles.xml
+@@ -0,0 +1,9 @@
++<resources>
++<style name="BattleDialog" parent="ThemeOverlay.MaterialComponents.MaterialAlertDialog">
++<item name="android:colorBackground">#17202C</item>
++<item name="colorSurface">#17202C</item>
++<item name="android:textColorPrimary">#FFFFFF</item>
++<item name="android:textColorSecondary">#CFD8E3</item>
++<item name="colorPrimary">#73DED5</item>
++</style>
++</resources>--- before/app/src/main/res/values/renewal.xml
++++ after/app/src/main/res/values/renewal.xml
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="boss_warning">CHARGE — use Shock!</string>
++    <string name="shock_ready">Shock arrow</string>
++    <string name="shock_wait">Shock %1$ds</string>
++    <string name="choose_upgrade">Choose your upgrade</string>
++    <string name="battle_wave">Wave %1$d/%2$s · %3$ds</string>
++    <string name="screen_shake">Screen shake</string>
++    <string name="resume_checkpoint">Resume your saved battle?</string>
++    <string name="new_expedition">New expedition</string>
++    <string name="choose_weapon">Choose a bow style</string>
++    <string name="choose_mode">Choose a mode</string>
++    <string name="next_goals">Next goals: Pierce %1$d/500 score · Control %2$d/1 clear · First supply %3$d/1</string>
++    <string name="battle_feedback">Battle feedback</string>
++    <string name="chapter_clear">Chapter cleared! Control bow and Endless unlocked.</string>
++    <string name="defeated_by">Defense broken by: %1$s</string>
++    <string name="best_difference">Previous best difference: %1$+d</string>
++    <string name="try_shock">Use the free Shock arrow to interrupt charges and break shields.</string>
++    <string-array name="card_names">
++        <item>Piercing shaft</item>
++        <item>Heavy tip</item>
++        <item>Armor breaker</item>
++        <item>Frost edge</item>
++        <item>Deep freeze</item>
++        <item>Glacier</item>
++        <item>Ember</item>
++        <item>Lingering flame</item>
++        <item>Inferno</item>
++        <item>Quick draw</item>
++        <item>Twin arrows</item>
++        <item>Storm</item>
++    </string-array>
++    <string-array name="card_descriptions">
++        <item>+1 enemy pierced. Max 3.</item>
++        <item>+0.5 damage. Max 3.</item>
++        <item>Evolution: ignore shields. Requires Piercing 2 + Heavy tip 1.</item>
++        <item>Slow enemies on hit. Max 3.</item>
++        <item>+1s slow duration. Max 3.</item>
++        <item>Evolution: hits briefly stun. Requires Frost 2 + Deep freeze 1.</item>
++        <item>Apply burn damage. Max 3.</item>
++        <item>+1s burn duration. Max 3.</item>
++        <item>Evolution: burning kills spread fire. Requires Ember 2 + Flame 1.</item>
++        <item>10% less base shot cooldown per rank. Max 3.</item>
++        <item>Fire two arrows; +10% damage per additional rank. Max 3.</item>
++        <item>Evolution: 35% less shot cooldown. Requires Quick draw 2 + Twin arrows 1.</item>
++    </string-array>
++    <string-array name="archetypes">
++        <item>Rapid — available</item>
++        <item>Pierce — 500 best score</item>
++        <item>Control — clear chapter</item>
++    </string-array>
++    <string-array name="battle_modes">
++        <item>Chapter · 8 waves</item>
++        <item>Endless</item>
++    </string-array>
++    <string-array name="enemy_names">
++        <item>Raider</item>
++        <item>Runner</item>
++        <item>Brute</item>
++        <item>Shield knight</item>
++        <item>Summoner</item>
++        <item>Ash king</item>
++    </string-array>
++</resources>--- before/app/src/main/res/values/strings.xml
++++ after/app/src/main/res/values/strings.xml
+@@ -35,16 +35,16 @@
+     <string name="bow_seraphic_name">세라픽 라이트 보우</string>
+     <string name="bow_abyss_name">어비스 블러드 보우</string>
+     <string name="bow_astra_name">아스트라 기어 보우</string>
+-    <string name="bow_bonus_20">공격 속도 20% 증가</string>
+-    <string name="bow_bonus_30">최강의 성능! 공격 속도 30% 증가</string>
++    <string name="bow_bonus_20" formatted="false">Shot cooldown −20%</string>
++    <string name="bow_bonus_30" formatted="false">Shot cooldown −30%</string>
+ 
+     <!-- 배틀 아이템 -->
+     <string name="item_potion_name">회복 물약</string>
+-    <string name="item_potion_desc">즉시 성 체력 1 회복</string>
++    <string name="item_potion_desc">Restore 3 HP (up to maximum).</string>
+     <string name="item_power_name">강화 화살</string>
+-    <string name="item_power_desc">20초 동안 공격력 50% 증가</string>
++    <string name="item_power_desc" formatted="false">20초 동안 공격력 50% 증가</string>
+     <string name="item_slow_name">시간 지연석</string>
+-    <string name="item_slow_desc">10초 동안 적 이동속도 50% 감소</string>
++    <string name="item_slow_desc" formatted="false">10초 동안 적 이동속도 50% 감소</string>
+ 
+     <!-- 결과 화면 -->
+     <string name="game_over">게임 오버</string>
+@@ -117,11 +117,11 @@
+     <string name="achievement_name_14">압도적인 방어</string>
+     <string name="achievement_desc_14">한 판 200킬</string>
+     <string name="achievement_name_15">안정적인 조준</string>
+-    <string name="achievement_desc_15">한 판 명중률 50% 이상</string>
++    <string name="achievement_desc_15" formatted="false">한 판 명중률 50% 이상</string>
+     <string name="achievement_name_16">정확한 궁수</string>
+-    <string name="achievement_desc_16">한 판 명중률 70% 이상</string>
++    <string name="achievement_desc_16" formatted="false">한 판 명중률 70% 이상</string>
+     <string name="achievement_name_17">명궁의 손끝</string>
+-    <string name="achievement_desc_17">한 판 명중률 85% 이상</string>
++    <string name="achievement_desc_17" formatted="false">한 판 명중률 85% 이상</string>
+     <string name="achievement_name_18">누적 명중 100회</string>
+     <string name="achievement_desc_18">누적 100회 명중</string>
+     <string name="achievement_name_19">누적 명중 500회</string>
+@@ -181,13 +181,13 @@
+     <string name="achievement_name_46">절약형 궁수</string>
+     <string name="achievement_desc_46">한 판에서 골드 사용 없이 180초 생존</string>
+     <string name="achievement_name_47">공격 집중</string>
+-    <string name="achievement_desc_47">한 판에서 100킬 이상, 명중률 60% 이상</string>
++    <string name="achievement_desc_47" formatted="false">한 판에서 100킬 이상, 명중률 60% 이상</string>
+     <string name="achievement_name_48">위기 극복</string>
+-    <string name="achievement_desc_48">체력이 30% 이하인 상태에서 30초 이상 추가 생존</string>
++    <string name="achievement_desc_48" formatted="false">체력이 30% 이하인 상태에서 30초 이상 추가 생존</string>
+     <string name="achievement_name_49">균형 잡힌 전투</string>
+-    <string name="achievement_desc_49">한 판에서 180초 생존, 50킬 이상, 명중률 60% 이상</string>
++    <string name="achievement_desc_49" formatted="false">한 판에서 180초 생존, 50킬 이상, 명중률 60% 이상</string>
+     <string name="achievement_name_50">BowDefense</string>
+-    <string name="achievement_desc_50">한 판에서 600초 생존, 300킬 이상, 명중률 70% 이상</string>
++    <string name="achievement_desc_50" formatted="false">한 판에서 600초 생존, 300킬 이상, 명중률 70% 이상</string>
+     <string name="achievement_name_51">전장의 생존가</string>
+     <string name="achievement_desc_51">회복 물약 10회 사용</string>
+     <string name="achievement_name_52">폭발적인 화력</string>
+--- before/app/src/test/java/com/example/bowdefense/BattleEngineTest.kt
++++ after/app/src/test/java/com/example/bowdefense/BattleEngineTest.kt
+@@ -0,0 +1,89 @@
++package com.example.bowdefense
++import org.junit.Test
++import org.junit.Assert.*
++import java.io.*
++
++class BattleEngineTest {
++    private fun simulate(fps: Int): RunState {
++        val e=BattleEngine(); e.aiming=true
++        repeat(fps*20) { e.advance(1.0/fps) }
++        return e.state
++    }
++    @Test fun frameRatesHaveIdenticalSimulation() {
++        val a=simulate(30); val b=simulate(60); val c=simulate(120)
++        assertEquals(a.time,b.time,1e-8); assertEquals(a.time,c.time,1e-8)
++        assertEquals(a.shots,b.shots); assertEquals(a.score,b.score); assertEquals(a.hp,b.hp)
++        assertEquals(a.enemies.map { it.x },b.enemies.map { it.x })
++    }
++    @Test fun idlePauseDoesNotAdvanceAnyTimers() {
++        val s=RunState(power=20.0,slow=10.0,shockIn=15.0)
++        val e=BattleEngine(s); repeat(60) { e.advance(1.0/60) }
++        val before=s.time; e.advance(0.0)
++        assertEquals(before,s.time,0.0); assertEquals(19.0,s.power,1e-8)
++    }
++    @Test fun firstChoiceFreezesClockAndRestoresExactly() {
++        val e=BattleEngine(); e.state.hp=1000
++        repeat(30*60) { e.advance(1.0/60) }
++        assertEquals(25.0,e.state.time,.02); assertEquals(3,e.state.choices.size)
++        val b=ByteArrayOutputStream(); ObjectOutputStream(b).use { it.writeObject(e.state) }
++        val restored=ObjectInputStream(ByteArrayInputStream(b.toByteArray())).use { it.readObject() as RunState }
++        assertEquals(e.state.sessionId,restored.sessionId); assertEquals(e.state.enemies,restored.enemies)
++        assertEquals(e.state.choices,restored.choices)
++        assertTrue(BattleEngine(restored).choose(restored.choices.first())); assertTrue(restored.firstChoiceAt>24)
++    }
++    @Test fun evolutionPrerequisitesAndCapsAreEnforced() {
++        val e=BattleEngine(); assertFalse(2 in e.availableCards())
++        e.state.levels[0]=2; e.state.levels[1]=1; assertTrue(2 in e.availableCards())
++        e.state.levels[2]=1; assertFalse(2 in e.availableCards())
++        e.state.levels[0]=3; assertFalse(0 in e.availableCards()); assertFalse(e.choose(0))
++    }
++    @Test fun damageRetainsFractionalPowerBonus() {
++        val e=BattleEngine(); val base=e.damage(); e.state.power=1.0
++        assertEquals(base*1.5,e.damage(),1e-9)
++    }
++    @Test fun continuationIsOnceAndKeepsBuildAndClock() {
++        val s=RunState(time=83.0,hp=0,ended=true,gold=91); s.levels[0]=2
++        val e=BattleEngine(s); assertTrue(e.revive()); assertEquals(83.0,s.time,0.0)
++        assertEquals(2,s.levels[0]); assertEquals(91,s.gold); s.ended=true; assertFalse(e.revive())
++    }
++    @Test fun shockHasCooldownAndPierces() {
++        val e=BattleEngine(); assertTrue(e.shock()); assertFalse(e.shock())
++        assertTrue(e.state.bolts.single().shock); assertEquals(50,e.state.bolts.single().pierce)
++    }
++    @Test fun accuracyCountsAnArrowOnlyOnceWhenPiercing() {
++        val s=RunState(spawnIn=99.0); s.enemies.add(Enemy(1,0,280.0,540.0,10.0,10.0)); s.enemies.add(Enemy(2,0,300.0,540.0,10.0,10.0))
++        val e=BattleEngine(s); e.shock(); e.advance(1.0/60)
++        assertEquals(1,s.hits); assertEquals(1,s.shots)
++    }
++    @Test fun scoreDoesNotIncreaseEnemyHealth() {
++        val a=BattleEngine(RunState(score=0)); val b=BattleEngine(RunState(score=100000))
++        repeat(61) { a.advance(1.0/60); b.advance(1.0/60) }
++        assertEquals(a.state.enemies.first().maxHp,b.state.enemies.first().maxHp,0.0)
++    }
++    @Test fun chapterEndsAfterBossAndMinimumWaveTime() {
++        val e=BattleEngine(RunState(wave=8,spawned=1,waveTime=29.0))
++        repeat(61) { e.advance(1.0/60) }; assertTrue(e.state.cleared); assertTrue(e.state.ended)
++    }
++    @Test fun eachFreeArchetypeCanClearWithAimedPlay() {
++        for(kind in 0..2) {
++            val e=BattleEngine(RunState(archetype=kind))
++            repeat(60*600) {
++                val s=e.state
++                if(s.choices.isNotEmpty()) {
++                    val priority=when(kind) { 0->listOf(10,9,11,0,1,2,3,4,5,6,7,8); 1->listOf(0,1,2,10,9,11,3,4,5,6,7,8); else->listOf(3,4,5,10,9,11,0,1,2,6,7,8) }
++                    e.choose(priority.first { it in s.choices })
++                }
++                val enemy=s.enemies.minByOrNull { it.x }
++                if(enemy!=null) {
++                    val lead=enemy.x-85*(enemy.x-250)/1500
++                    e.aim=kotlin.math.atan2(enemy.y-540,lead-250); e.aiming=true
++                    if(enemy.x<950 || enemy.kind==5 && enemy.age%12<2) e.shock()
++                } else e.aiming=false
++                if(!s.ended) e.advance(1.0/60)
++            }
++            println("BALANCE archetype=$kind clear=${e.state.cleared} time=${e.state.time.toInt()} wave=${e.state.wave} hp=${e.state.hp} kills=${e.state.kills}")
++            assertTrue("Archetype $kind stopped at wave ${e.state.wave}",e.state.cleared)
++            assertTrue("Chapter too long",e.state.time<360)
++        }
++    }
++}
