@@ -1,0 +1,16 @@
+{
+  "date": "2026-11-27",
+  "before_text_files": 61,
+  "after_text_files": 61,
+  "changed_files": [
+    "app/src/main/java/com/example/bowdefense/GameActivity.kt",
+    "app/src/main/java/com/example/bowdefense/MainActivity.kt"
+  ],
+  "locales": 43,
+  "production_source_modified": false,
+  "release_aab_replaced": false,
+  "store_saved": true,
+  "store_submitted": true,
+  "submission_blocker": null,
+  "observed_status": "Changes are being reviewed. Automated-check progress notice has cleared. Trader declaration completed by owner."
+}

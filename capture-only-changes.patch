@@ -1,0 +1,30 @@
+--- before/app/src/main/java/com/example/bowdefense/GameActivity.kt
++++ after-capture-only/app/src/main/java/com/example/bowdefense/GameActivity.kt
+@@ -315,6 +315,7 @@
+     }
+ 
+     private fun loadInterstitialAd() {
++        return // Screenshot-only working copy: never request advertising.
+         val adRequest = AdRequest.Builder().build()
+         InterstitialAd.load(this, "REDACTED_AD_IDENTIFIER", adRequest, 
+             object : InterstitialAdLoadCallback() {
+--- before/app/src/main/java/com/example/bowdefense/MainActivity.kt
++++ after-capture-only/app/src/main/java/com/example/bowdefense/MainActivity.kt
+@@ -27,7 +27,7 @@
+         setContentView(R.layout.activity_main)
+ 
+         // Mobile Ads SDK 초기화
+-        MobileAds.initialize(this) {}
++        // Screenshot-only working copy: advertising is disabled.
+ 
+         saveManager = SaveManager(this)
+         lifeManager = LifeManager(this)
+@@ -52,7 +52,7 @@
+         // 광고 로드
+         adView = findViewById(R.id.adViewMain)
+         val adRequest = AdRequest.Builder().build()
+-        adView.loadAd(adRequest)
++        adView.visibility = android.view.View.GONE
+ 
+         // 게임 시작
+         startButton.setOnClickListener {
